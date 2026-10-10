@@ -1,0 +1,20 @@
+# Web Framework & ASGI Server
+fastapi==0.142.2
+uvicorn==0.54.0
+
+# Data Validation & Models
+pydantic==2.13.5
+
+# Google AI & Agent Framework
+google-antigravity==0.1.20
+google-genai==2.28.0
+
+# Environment Variable Management
+python-dotenv==1.2.4
+
+# HTTP Client (FastAPI TestClient & Requests)
+httpx==0.28.1
+requests==2.34.2
+
+# Form & Multipart Support
+python-multipart==0.0.32

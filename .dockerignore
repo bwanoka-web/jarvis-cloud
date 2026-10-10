@@ -1,0 +1,53 @@
+# ==============================================================================
+# J.A.R.V.I.S. Docker Ignore Specification
+# Prevents large local binaries, logs, and venvs from polluting the Linux image
+# ==============================================================================
+
+# Git関連
+.git
+.gitignore
+
+# Python仮想環境およびキャッシュ
+.venv/
+venv/
+ENV/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Windows専用実行ファイルおよびローカルツール（計88MB超の除外）
+*.exe
+cloudflared.exe
+cloudflared2.exe
+
+# ログファイルおよび一時出力
+*.log
+cf.log
+cloudflared.log
+pinggy_out.txt
+test_out.txt
+test.txt
+
+# ローカル環境設定（コンテナ外から環境変数を注入するため除外）
+.env
+.env.*
+
+# バックアップおよび一時修正スクリプト
+*.bak
+main.py.bak
+fix*.py
+test_models.py
+test.py
+
+# エージェント用作業メタデータ（プロジェクト本体に不要）
+.agents/
+a4baa93089e4e3893b2e90c409743258/
+
+# workspaceの既存データ（空の状態で起動するため除外）
+workspace/requests/*
+workspace/reports/*
+!workspace/requests/.gitkeep
+!workspace/reports/.gitkeep
