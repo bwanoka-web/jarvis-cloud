@@ -2,7 +2,7 @@ services:
   - type: web
     name: clinical-pocket-partner
     runtime: docker
-    plan: starter
+    plan: free
     region: singapore
     dockerfilePath: ./Dockerfile
     dockerContext: .
