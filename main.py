@@ -2,6 +2,7 @@ import asyncio
 from datetime import datetime, timezone
 import json
 import os
+import re
 import secrets
 import time
 import uuid
@@ -129,6 +130,15 @@ async def get_latest_report(username: str = Depends(get_current_username)):
             except Exception:
                 pass
 
+        if not spoken_summary and content.startswith("---"):
+            match = re.search(r'spoken_summary:\s*(?:"(.*?)"|([\S\s]*?))\n---', content)
+            if match:
+                summary_val = match.group(1) or match.group(2)
+                try:
+                    spoken_summary = json.loads(f'"{summary_val}"') if not summary_val.startswith('"') else json.loads(summary_val)
+                except Exception:
+                    spoken_summary = summary_val.strip()
+
         return {"filename": latest_file, "content": content, "spoken_summary": spoken_summary}
     except Exception as e:
         return {"filename": None, "content": f"Error loading report: {str(e)}", "spoken_summary": ""}
@@ -222,6 +232,7 @@ async def get_dashboard(username: str = Depends(get_current_username)):
             let isAiThinking = false;
             let isAudioUnlocked = false;
             let isRecognizing = false;
+            let isStarting = false;
             let ttsSafetyTimer = null;
             let micCooldownTimer = null;
             let lastSpokenText = "";
@@ -236,18 +247,20 @@ async def get_dashboard(username: str = Depends(get_current_username)):
 
             function restartRecognitionIfNeeded() {
                 if (!isContinuousMode || isAiSpeaking || isAiThinking || !recognition) return;
-                if (isRecognizing) return;
+                if (isRecognizing || isStarting) return;
                 try {
+                    isStarting = true;
                     recognition.start();
                     micBtn.classList.remove('jarvis-btn-thinking');
                     micBtn.classList.add('jarvis-btn-active');
                     micBtn.innerText = '🎙️ お話しください...（全音声に反応）';
                     statusText.innerText = '周囲の音声を監視中...';
                 } catch (e) {
+                    isStarting = false;
                     if (e.name !== 'NotAllowedError') {
                         setTimeout(() => {
-                            if (isContinuousMode && !isAiSpeaking && !isAiThinking && !isRecognizing) {
-                                try { recognition.start(); } catch(_) {}
+                            if (isContinuousMode && !isAiSpeaking && !isAiThinking && !isRecognizing && !isStarting) {
+                                try { isStarting = true; recognition.start(); } catch(_) { isStarting = false; }
                             }
                         }, 500);
                     }
@@ -262,6 +275,7 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                 recognition.maxAlternatives = 1;
 
                 recognition.onstart = () => {
+                    isStarting = false;
                     isRecognizing = true;
                     if (isAiSpeaking || isAiThinking) return;
                     micBtn.classList.remove('jarvis-btn', 'jarvis-btn-thinking');
@@ -276,21 +290,32 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                 recognition.onresult = (event) => {
                     if (isAiSpeaking || isAiThinking || (window.speechSynthesis && window.speechSynthesis.speaking)) return;
                     
-                    const last = event.results.length - 1;
-                    let transcript = event.results[last][0].transcript.trim();
-                    if (!transcript || transcript.length < 2) return;
+                    let newTranscript = "";
+                    for (let i = event.resultIndex; i < event.results.length; ++i) {
+                        const t = event.results[i][0].transcript.trim();
+                        if (t) newTranscript += t + " ";
+                    }
+                    newTranscript = newTranscript.trim();
+                    if (!newTranscript || newTranscript.length < 2) return;
+
+                    // システム定型アナウンスのエコー誤検知フィルター
+                    const systemPhrases = ["リクエストを受け付け", "バックグラウンド調査", "キューに登録", "報告書が完成しました", "内容を読み上げます", "以下省略します"];
+                    if (systemPhrases.some(p => newTranscript.includes(p))) {
+                        console.log("System message echo ignored:", newTranscript);
+                        return;
+                    }
                     
                     // TTS発話直後のエコー・マイク誤検知フィルター
                     if (Date.now() - lastSpokenTime < 4000 && lastSpokenText) {
-                        const cleanT = transcript.replace(/[、。！？\\s]/g, '');
+                        const cleanT = newTranscript.replace(/[、。！？\\s]/g, '');
                         const cleanS = lastSpokenText.replace(/[、。！？\\s]/g, '');
                         if (cleanS.includes(cleanT) || cleanT.includes(cleanS.substring(0, 15))) {
-                            console.log("TTS echo ignored:", transcript);
+                            console.log("TTS echo ignored:", newTranscript);
                             return;
                         }
                     }
                     
-                    transcriptBuffer += transcript + " ";
+                    transcriptBuffer += newTranscript + " ";
                     statusText.innerText = '認識中... (' + transcriptBuffer.trim() + ')';
                     input.value = transcriptBuffer.trim();
                     
@@ -303,6 +328,7 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                 };
 
                 recognition.onerror = (event) => {
+                    isStarting = false;
                     console.warn("Speech recognition error:", event.error);
                     switch (event.error) {
                         case 'not-allowed':
@@ -335,6 +361,7 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                 };
 
                 recognition.onend = () => {
+                    isStarting = false;
                     isRecognizing = false;
                     if (isContinuousMode && !isAiSpeaking && !isAiThinking) {
                         setTimeout(() => {
@@ -426,12 +453,14 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                 utterance.lang = 'ja-JP';
                 utterance.rate = 1.1; 
                 utterance.pitch = 0.9;
+                window.currentUtterance = utterance;
 
                 const cleanupAndFinish = () => {
                     if (ttsSafetyTimer) {
                         clearTimeout(ttsSafetyTimer);
                         ttsSafetyTimer = null;
                     }
+                    window.currentUtterance = null;
                     onAiFinishedSpeaking();
                 };
 
@@ -442,6 +471,9 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                 };
 
                 const doSpeak = () => {
+                    if (window.speechSynthesis.speaking || window.speechSynthesis.pending) {
+                        try { window.speechSynthesis.cancel(); } catch(_) {}
+                    }
                     const voices = window.speechSynthesis.getVoices();
                     const jpVoices = voices.filter(v => v.lang.includes('ja'));
                     if (jpVoices.length > 0) {
@@ -488,6 +520,7 @@ async def get_dashboard(username: str = Depends(get_current_username)):
 
             function onAiFinishedSpeaking() {
                 if (!isAiSpeaking) return;
+                lastSpokenTime = Date.now();
                 if (micCooldownTimer) clearTimeout(micCooldownTimer);
 
                 // エコー防止ステップ2: スピーカー残響回避のためのクールダウン（1000ms）
@@ -595,7 +628,9 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                         // リクエスト受付完了後に音声認識を再開
                         restartRecognitionIfNeeded();
                     }
-                    input.focus();
+                    if (!isContinuousMode) {
+                        input.focus();
+                    }
                 }
             });
 

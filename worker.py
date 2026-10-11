@@ -24,7 +24,7 @@ api_key = os.environ.get("GEMINI_API_KEY", "").strip()
 worker_config = LocalAgentConfig(
     api_key=api_key if api_key else None,
     system_instructions="あなたはJ.A.R.V.I.S.の裏側で稼働する自律リサーチエージェントです。与えられた依頼に対して、Web検索などを駆使して詳細な調査を行い、報告書を作成してください。出力は必ず以下のJSON形式とし、それ以外のテキストは含めないでください。\n{\"spoken_summary\": \"<TTSで読み上げるための2〜3文の短い要約>\", \"markdown_report\": \"<マークダウン形式の詳細な報告書本文>\"}",
-    model="gemini-2.5-flash",
+    model="gemini-2.5-flash-lite",
     capabilities=CapabilitiesConfig(
         enabled_tools=["search_web", "read_url_content"]
     )
@@ -191,9 +191,35 @@ async def _process_queue_with_agent(agent) -> int:
 
             query = extract_prompt_from_content(processing_file, content)
 
-            print(f"Processing task: {req_file}")
-            # キュー詰まり防止のため180秒のタイムアウトを設定
-            response = await asyncio.wait_for(agent.chat(query), timeout=180.0)
+            # キュー詰まり防止のため180秒のタイムアウトを設定、モデル障害時はフォールバックを試行
+            try:
+                response = await asyncio.wait_for(agent.chat(query), timeout=180.0)
+            except Exception as primary_err:
+                # テスト用のモックオブジェクトやAPIキー未設定時は再送出
+                if not hasattr(agent, '_config') or not api_key:
+                    raise primary_err
+                print(f"Primary model failed ({primary_err}). Attempting fallback model...")
+                fallback_models = ["gemini-flash-lite-latest", "gemini-2.5-flash"]
+                success_fb = False
+                for fb_model in fallback_models:
+                    if fb_model == getattr(getattr(agent, '_config', None), 'model', None):
+                        continue
+                    try:
+                        print(f"Trying fallback model: {fb_model}")
+                        fb_config = LocalAgentConfig(
+                            api_key=api_key,
+                            system_instructions=worker_config.system_instructions,
+                            model=fb_model,
+                            capabilities=CapabilitiesConfig(enabled_tools=["search_web", "read_url_content"])
+                        )
+                        async with Agent(fb_config) as fb_agent:
+                            response = await asyncio.wait_for(fb_agent.chat(query), timeout=180.0)
+                            success_fb = True
+                            break
+                    except Exception as fb_err:
+                        print(f"Fallback model {fb_model} failed: {fb_err}")
+                if not success_fb:
+                    raise primary_err
 
             if hasattr(response, 'text'):
                 if callable(response.text):
@@ -290,26 +316,30 @@ async def run_worker():
     consecutive_errors = 0
     total_processed = 0
 
-    async with Agent(worker_config) as agent:
-        while True:
-            try:
-                recover_stale_processing_files()
-                processed = await run_worker_once(agent)
+    while True:
+        try:
+            async with Agent(worker_config) as agent:
+                while True:
+                    recover_stale_processing_files()
+                    processed = await run_worker_once(agent)
 
-                if processed > 0:
-                    consecutive_errors = 0
-                    total_processed += processed
-                    print(f"Processed {processed} tasks (Total: {total_processed}).")
-                    await asyncio.sleep(fast_interval)
-                else:
-                    consecutive_errors = 0
-                    await asyncio.sleep(idle_interval)
+                    if processed > 0:
+                        consecutive_errors = 0
+                        total_processed += processed
+                        print(f"Processed {processed} tasks (Total: {total_processed}).")
+                        # 5タスク処理ごとにエージェントセッションを刷新して履歴蓄積を防止
+                        if total_processed % 5 == 0:
+                            break
+                        await asyncio.sleep(fast_interval)
+                    else:
+                        consecutive_errors = 0
+                        await asyncio.sleep(idle_interval)
 
-            except Exception as e:
-                consecutive_errors += 1
-                backoff_time = min(error_base_interval * (2 ** (consecutive_errors - 1)), max_error_interval)
-                print(f"Worker loop error ({consecutive_errors} consecutive): {e}. Backing off for {backoff_time:.1f}s")
-                await asyncio.sleep(backoff_time)
+        except Exception as e:
+            consecutive_errors += 1
+            backoff_time = min(error_base_interval * (2 ** (consecutive_errors - 1)), max_error_interval)
+            print(f"Worker loop error ({consecutive_errors} consecutive): {e}. Backing off for {backoff_time:.1f}s")
+            await asyncio.sleep(backoff_time)
 
 
 if __name__ == "__main__":

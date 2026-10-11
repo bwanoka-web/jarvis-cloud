@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime
 import glob
 import json
 import os
@@ -127,6 +128,40 @@ class TestAudioAndQueueFix(unittest.TestCase):
         data = res.json()
         self.assertEqual(data["spoken_summary"], "敗血症の診断基準要約です。")
         self.assertIn("SOFAスコア詳細", data["content"])
+
+    def test_system_phrase_and_empty_prompt_guards(self):
+        """システムアナウンス音声の誤検知およびマイク誤爆防止がフロントエンドで安全に防御されること"""
+        # フロントエンドHTML内にシステム定型アナウンス破棄フィルターおよびモバイル用フォーカス制御が存在すること
+        res = self.client.get("/", auth=("admin", "password123"))
+        html = res.text
+        self.assertIn("systemPhrases", html)
+        self.assertIn("!isContinuousMode", html)
+        self.assertIn("window.currentUtterance", html)
+
+    def test_frontmatter_fallback_in_latest_report(self):
+        """JSON成果物が欠落している場合でも、Markdown Frontmatterからspoken_summaryが復元されること"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        md_file = os.path.join(REPORTS_DIR, f"report_{timestamp}_test_fm.md")
+        fm_content = (
+            "---\n"
+            "request_id: test_fm\n"
+            f"timestamp: {timestamp}\n"
+            'spoken_summary: "Frontmatterから復元された要約です。"\n'
+            "---\n\n"
+            "# テスト本文\n"
+        )
+        with open(md_file, "w", encoding="utf-8") as f:
+            f.write(fm_content)
+
+        res = self.client.get("/api/latest_report", auth=("admin", "password123"))
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(data["spoken_summary"], "Frontmatterから復元された要約です。")
+        self.assertIn("テスト本文", data["content"])
+
+    def test_worker_uses_flash_lite_model(self):
+        """クォータ枯渇（HTTP 429）を回避するため、worker_configのモデルがgemini-2.5-flash-liteであること"""
+        self.assertEqual(worker.worker_config.model, "gemini-2.5-flash-lite")
 
 
 if __name__ == "__main__":
