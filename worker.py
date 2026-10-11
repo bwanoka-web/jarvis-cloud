@@ -19,11 +19,14 @@ REPORTS_DIR = os.path.join(WORKSPACE_DIR, "reports")
 os.makedirs(REQUESTS_DIR, exist_ok=True)
 os.makedirs(REPORTS_DIR, exist_ok=True)
 
+api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+
 worker_config = LocalAgentConfig(
+    api_key=api_key if api_key else None,
     system_instructions="あなたはJ.A.R.V.I.S.の裏側で稼働する自律リサーチエージェントです。与えられた依頼に対して、Web検索などを駆使して詳細な調査を行い、報告書を作成してください。出力は必ず以下のJSON形式とし、それ以外のテキストは含めないでください。\n{\"spoken_summary\": \"<TTSで読み上げるための2〜3文の短い要約>\", \"markdown_report\": \"<マークダウン形式の詳細な報告書本文>\"}",
     model="gemini-2.5-flash",
     capabilities=CapabilitiesConfig(
-        enable_web_search=True
+        enabled_tools=["search_web", "read_url_content"]
     )
 )
 
@@ -117,7 +120,7 @@ def clean_and_parse_llm_response(report_text: str) -> tuple[str, str]:
 
 
 def recover_stale_processing_files(timeout_seconds: int = 300) -> int:
-    """タイムアウトした孤立 .processing ファイルを検知して復旧する"""
+    """タイムアウトした孤立 .processing ファイルを検知して復旧し、古い残留 .tmp ファイルを清掃する"""
     now = time.time()
     recovered_count = 0
     for proc_file in glob.glob(os.path.join(REQUESTS_DIR, "*.processing")):
@@ -129,6 +132,16 @@ def recover_stale_processing_files(timeout_seconds: int = 300) -> int:
                 recovered_count += 1
         except OSError as e:
             print(f"ファイル復旧エラー ({proc_file}): {e}")
+
+    # クラッシュや中断で放置された古い .tmp ファイルの清掃
+    for tmp_file in glob.glob(os.path.join(REQUESTS_DIR, "*.tmp")):
+        try:
+            if now - os.path.getmtime(tmp_file) > 120:
+                os.remove(tmp_file)
+                print(f"放置された一時ファイルを整理しました: {tmp_file}")
+        except OSError:
+            pass
+
     return recovered_count
 
 
@@ -179,7 +192,8 @@ async def _process_queue_with_agent(agent) -> int:
             query = extract_prompt_from_content(processing_file, content)
 
             print(f"Processing task: {req_file}")
-            response = await agent.chat(query)
+            # キュー詰まり防止のため180秒のタイムアウトを設定
+            response = await asyncio.wait_for(agent.chat(query), timeout=180.0)
 
             if hasattr(response, 'text'):
                 if callable(response.text):
@@ -198,25 +212,18 @@ async def _process_queue_with_agent(agent) -> int:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             basename = os.path.basename(req_file).replace(".json", "").replace(".txt", "")
 
-            # Frontmatter付きマークダウン本文の構築
+            # Frontmatter付きマークダウン本文の構築（ダブルクォートエスケープ対応）
+            safe_summary = json.dumps(spoken_summary, ensure_ascii=False)
             full_markdown = (
                 f"---\n"
                 f"request_id: {basename}\n"
                 f"timestamp: {timestamp}\n"
-                f'spoken_summary: "{spoken_summary}"\n'
+                f"spoken_summary: {safe_summary}\n"
                 f"---\n\n"
                 f"{markdown_content}\n"
             )
 
-            # アトミック書き込みによるマークダウンレポート生成
-            report_md_filename = f"report_{timestamp}_{basename}.md"
-            report_md_path = os.path.join(REPORTS_DIR, report_md_filename)
-            temp_md_path = report_md_path + ".tmp"
-            with open(temp_md_path, "w", encoding="utf-8") as f:
-                f.write(full_markdown)
-            os.replace(temp_md_path, report_md_path)
-
-            # アトミック書き込みによる音声要約JSON生成
+            # アトミック書き込みによる音声要約JSON生成（クライアントポーリングの整合性のためJSONを先に出力）
             report_json_filename = f"report_{timestamp}_{basename}.json"
             report_json_path = os.path.join(REPORTS_DIR, report_json_filename)
             temp_json_path = report_json_path + ".tmp"
@@ -228,6 +235,14 @@ async def _process_queue_with_agent(agent) -> int:
             with open(temp_json_path, "w", encoding="utf-8") as f:
                 json.dump(json_payload, f, ensure_ascii=False, indent=2)
             os.replace(temp_json_path, report_json_path)
+
+            # アトミック書き込みによるマークダウンレポート生成
+            report_md_filename = f"report_{timestamp}_{basename}.md"
+            report_md_path = os.path.join(REPORTS_DIR, report_md_filename)
+            temp_md_path = report_md_path + ".tmp"
+            with open(temp_md_path, "w", encoding="utf-8") as f:
+                f.write(full_markdown)
+            os.replace(temp_md_path, report_md_path)
 
             print(f"Generated reports: {report_md_path} and {report_json_path}")
 
