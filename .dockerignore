@@ -52,5 +52,6 @@ workspace/reports/*
 !workspace/requests/.gitkeep
 !workspace/reports/.gitkeep
 
-# projects（ローカル資産・開発プロジェクト除外）
-projects/
+# projects（ソースコード実体は除外、台帳のみ同期）
+projects/*
+!projects/PROJECTS_CATALOG.md

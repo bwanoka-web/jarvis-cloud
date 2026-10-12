@@ -3,5 +3,6 @@ __pycache__/
 *.pyc
 .env
 workspace/
-projects/
+projects/*
+!projects/PROJECTS_CATALOG.md
 
