@@ -343,6 +343,8 @@ async def get_dashboard(username: str = Depends(get_current_username)):
             let micCooldownTimer = null;
             let lastSpokenText = "";
             let lastSpokenTime = 0;
+            let transcriptBuffer = "";
+            let speechTimeout = null;
 
             // 車載音声コマンド（ウェイクワードの有無に関わらず全音声に自然反応）
             const WAKE_WORDS = ["ジャービス", "jarvis", "ジャビス"];
@@ -467,9 +469,6 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                     micBtn.innerText = '🎙️ お話しください...（全音声に反応）';
                     statusText.innerText = '周囲の音声を監視中...';
                 };
-
-                let transcriptBuffer = "";
-                let speechTimeout = null;
                 
                 recognition.onresult = (event) => {
                     if (isAiSpeaking || isAiThinking || (window.speechSynthesis && window.speechSynthesis.speaking)) return;
@@ -773,14 +772,16 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                 if (!message) return;
 
                 // 認識タイマーのクリアとマイクの一時停止
-                if (speechTimeout) {
-                    clearTimeout(speechTimeout);
-                    speechTimeout = null;
-                }
-                transcriptBuffer = "";
-                if (recognition) {
-                    try { recognition.abort(); } catch(e) {}
-                }
+                try {
+                    if (typeof speechTimeout !== 'undefined' && speechTimeout) {
+                        clearTimeout(speechTimeout);
+                        speechTimeout = null;
+                    }
+                    transcriptBuffer = "";
+                    if (recognition) {
+                        recognition.abort();
+                    }
+                } catch(err) {}
                 isRecognizing = false;
 
                 isAiThinking = true;
@@ -914,7 +915,14 @@ async def get_dashboard(username: str = Depends(get_current_username)):
     </body>
     </html>
     """
-    return html_content
+    return HTMLResponse(
+        content=html_content,
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        }
+    )
 
 if __name__ == "__main__":
     import uvicorn
