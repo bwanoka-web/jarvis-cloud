@@ -101,7 +101,7 @@ def safe_read_url_content(url: str) -> str:
 worker_config = LocalAgentConfig(
     api_key=api_key if api_key else None,
     system_instructions=SYSTEM_INSTRUCTIONS,
-    model="gemini-2.5-flash-lite",
+    model="gemini-2.5-flash",
     capabilities=CapabilitiesConfig(
         enabled_tools=["search_web"]
     ),
@@ -191,6 +191,20 @@ def sanitize_spoken_summary(text: str) -> str:
     return cleaned if cleaned else "報告書が完成しました。"
 
 
+async def extract_text_from_response(response) -> str:
+    """ChatResponseから確実にテキスト文字列を取得するヘルパー"""
+    if response is None:
+        return ""
+    if hasattr(response, 'text'):
+        if callable(response.text):
+            res_text = response.text()
+            if asyncio.iscoroutine(res_text):
+                return await res_text
+            return str(res_text)
+        return str(response.text)
+    return str(response)
+
+
 def clean_and_parse_llm_response(report_text: str) -> tuple[str, str]:
     """LLMの応答テキストから markdown_report と spoken_summary を安全に抽出する"""
     clean_text = report_text.strip() if report_text else ""
@@ -204,6 +218,8 @@ def clean_and_parse_llm_response(report_text: str) -> tuple[str, str]:
             markdown_content = result_json.get("markdown_report", clean_text)
             raw_summary = result_json.get("spoken_summary", "")
             spoken_summary = sanitize_spoken_summary(raw_summary)
+            if not markdown_content or not str(markdown_content).strip():
+                markdown_content = clean_text
             return markdown_content, spoken_summary
     except Exception:
         pass
@@ -218,6 +234,8 @@ def clean_and_parse_llm_response(report_text: str) -> tuple[str, str]:
                 markdown_content = result_json.get("markdown_report", clean_text)
                 raw_summary = result_json.get("spoken_summary", "")
                 spoken_summary = sanitize_spoken_summary(raw_summary)
+                if not markdown_content or not str(markdown_content).strip():
+                    markdown_content = clean_text
                 return markdown_content, spoken_summary
         except Exception:
             pass
@@ -232,6 +250,8 @@ def clean_and_parse_llm_response(report_text: str) -> tuple[str, str]:
                 markdown_content = result_json.get("markdown_report", clean_text)
                 raw_summary = result_json.get("spoken_summary", "")
                 spoken_summary = sanitize_spoken_summary(raw_summary)
+                if not markdown_content or not str(markdown_content).strip():
+                    markdown_content = clean_text
                 return markdown_content, spoken_summary
         except Exception:
             pass
@@ -378,21 +398,22 @@ async def _process_queue_with_agent(agent) -> int:
                 prompt_to_send = query
 
             # キュー詰まり防止のため180秒のタイムアウトを設定、モデル障害時はフォールバックを試行
+            report_text = ""
             try:
                 response = await asyncio.wait_for(agent.chat(prompt_to_send), timeout=180.0)
+                report_text = await extract_text_from_response(response)
             except Exception as primary_err:
+                print(f"Primary model failed ({primary_err}). Attempting fallback model...")
                 # テスト用のモックオブジェクトやAPIキー未設定時は再送出
                 if not hasattr(agent, '_config') or not api_key:
                     raise primary_err
-                print(f"Primary model failed ({primary_err}). Attempting fallback model...")
-                fallback_models = ["gemini-flash-lite-latest", "gemini-2.5-flash"]
-                success_fb = False
+
+                fallback_models = ["gemini-flash-latest", "gemini-flash-lite-latest", "gemini-3.1-flash-lite-preview"]
                 for fb_model in fallback_models:
                     if fb_model == getattr(getattr(agent, '_config', None), 'model', None):
                         continue
                     try:
                         print(f"Trying fallback model: {fb_model}")
-                        # 孤立誤判定防止のため処理中ファイルのタイムスタンプを更新
                         touch_processing_file(processing_file)
                         fb_config = LocalAgentConfig(
                             api_key=api_key,
@@ -402,27 +423,30 @@ async def _process_queue_with_agent(agent) -> int:
                             tools=[safe_read_url_content]
                         )
                         async with Agent(fb_config) as fb_agent:
-                            response = await asyncio.wait_for(fb_agent.chat(prompt_to_send), timeout=180.0)
-                            success_fb = True
-                            break
+                            fb_resp = await asyncio.wait_for(fb_agent.chat(prompt_to_send), timeout=180.0)
+                            extracted = await extract_text_from_response(fb_resp)
+                            if extracted and extracted.strip():
+                                report_text = extracted
+                                print(f"Fallback model {fb_model} succeeded.")
+                                break
                     except Exception as fb_err:
                         print(f"Fallback model {fb_model} failed: {fb_err}")
-                if not success_fb:
-                    raise primary_err
 
-            if hasattr(response, 'text'):
-                if callable(response.text):
-                    res_text = response.text()
-                    if asyncio.iscoroutine(res_text):
-                        report_text = await res_text
-                    else:
-                        report_text = res_text
-                else:
-                    report_text = response.text
+            # すべてのモデルで応答が取得できなかった場合のフェイルセーフ（絶対に沈黙しない）
+            if not report_text or not report_text.strip():
+                print(f"All models failed or returned empty text for {req_file}. Generating fail-safe alert report.")
+                markdown_content = (
+                    "### J.A.R.V.I.S. システム通信通知\n\n"
+                    "AI推論サービス（Gemini API）への通信が一時的に混雑または制限に達したため、自動リトライを実行しましたが即時回答を完了できませんでした。\n\n"
+                    "**推奨される対応**:\n"
+                    "- 車内マイクまたは送信ボタンから、数十秒ほど間隔をあけて再度指示をお話しください。\n"
+                    "- システムは自動復旧モードを維持しており、次回リクエストを正常に処理します。"
+                )
+                spoken_summary = "社長、申し訳ありません。AI通信が一時的に混雑したため、回答を生成できませんでした。少し時間をおいて、もう一度お話しください。"
             else:
-                report_text = str(response)
-
-            markdown_content, spoken_summary = clean_and_parse_llm_response(report_text)
+                markdown_content, spoken_summary = clean_and_parse_llm_response(report_text)
+                if not markdown_content or not markdown_content.strip():
+                    markdown_content = report_text.strip()
 
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             basename = os.path.basename(req_file).replace(".json", "").replace(".txt", "")
@@ -470,6 +494,32 @@ async def _process_queue_with_agent(agent) -> int:
 
         except Exception as e:
             print(f"Error processing {req_file}: {e}")
+            try:
+                # 予期せぬエラー時もクライアントのハングアップを防ぐためフェイルセーフレポートを生成
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                basename = os.path.basename(req_file).replace(".json", "").replace(".txt", "").replace(".processing", "")
+                err_summary = "社長、システム内部で予期せぬエラーが発生しました。時間を置いて再度お試しください。"
+                err_md = (
+                    f"---\n"
+                    f"request_id: {basename}\n"
+                    f"timestamp: {timestamp}\n"
+                    f'spoken_summary: "{err_summary}"\n'
+                    f"---\n\n"
+                    f"### システム内部エラー通知\n\n"
+                    f"リクエストの処理中に例外が発生しました（詳細: {type(e).__name__}）。\n"
+                    f"安全のためファイルは隔離されました。再送をお試しください。\n"
+                )
+                j_path = os.path.join(REPORTS_DIR, f"report_{timestamp}_{basename}.json")
+                m_path = os.path.join(REPORTS_DIR, f"report_{timestamp}_{basename}.md")
+                with open(j_path + ".tmp", "w", encoding="utf-8") as jf:
+                    json.dump({"request_id": basename, "timestamp": timestamp, "spoken_summary": err_summary}, jf, ensure_ascii=False)
+                os.replace(j_path + ".tmp", j_path)
+                with open(m_path + ".tmp", "w", encoding="utf-8") as mf:
+                    mf.write(err_md)
+                os.replace(m_path + ".tmp", m_path)
+            except Exception as inner_e:
+                print(f"フェイルセーフレポート生成失敗: {inner_e}")
+
             try:
                 if os.path.exists(processing_file):
                     os.replace(processing_file, processing_file + ".error")

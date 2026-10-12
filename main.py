@@ -824,6 +824,16 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                 isRecognizing = false;
                 hasPendingRequest = true;
 
+                if (window.pendingRequestTimer) clearTimeout(window.pendingRequestTimer);
+                window.pendingRequestTimer = setTimeout(() => {
+                    if (hasPendingRequest) {
+                        hasPendingRequest = false;
+                        isAiThinking = false;
+                        statusText.innerText = '待機時間を超過しました。再度お話しいただくか送信してください。';
+                        if (isContinuousMode) restartRecognitionIfNeeded();
+                    }
+                }, 90000);
+
                 // iOS Safari オーディオパイプラインの事前活性化（回答受信時の無音防止）
                 try {
                     unlockAudio();
@@ -942,10 +952,17 @@ async def get_dashboard(username: str = Depends(get_current_username)):
 
                             // 新着レポート、またはユーザーが指示を出して待機していた場合は必ず全文朗読
                             if (!isInitialReportLoad || isNewReport || hasPendingRequest) {
+                                if (window.pendingRequestTimer) {
+                                    clearTimeout(window.pendingRequestTimer);
+                                    window.pendingRequestTimer = null;
+                                }
                                 hasPendingRequest = false;
+                                isAiThinking = false;
+                                statusText.innerText = '最新レポートを受信しました';
+
                                 if (data.spoken_summary && data.spoken_summary.trim().length > 0) {
                                     speakText(data.spoken_summary, false);
-                                } else {
+                                } else if (data.content && data.content.trim().length > 0) {
                                     let plainText = data.content.replace(/[#*`_>~]/g, "").trim();
                                     speakText("調査が完了しました。ご報告いたします。" + plainText, false);
                                 }

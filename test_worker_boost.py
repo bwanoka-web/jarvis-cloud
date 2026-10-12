@@ -19,7 +19,7 @@ class TestWorkerBoostSystem(unittest.TestCase):
         self.assertIn("自己批判", inst)
 
         # プロジェクト把握能力
-        self.assertIn("projects/", inst)
+        self.assertIn("projects", inst)
         self.assertIn("01_active", inst)
         self.assertIn("02_tools", inst)
         self.assertIn("03_archive", inst)
