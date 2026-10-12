@@ -91,6 +91,12 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         if request.url.path in ("/health", "/healthz"):
             return JSONResponse({"status": "ok", "service": "JARVIS Receptionist"})
 
+        # HTTPアクセス時のHTTPS自動リダイレクト（マイクAPI保護のため）
+        proto = request.headers.get("x-forwarded-proto", "").lower()
+        if proto == "http":
+            url = request.url.replace(scheme="https")
+            return Response(status_code=301, headers={"Location": str(url)})
+
         response: Response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
@@ -98,7 +104,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; "
-            "script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://cdn.jsdelivr.net; "
+            "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.tailwindcss.com https://cdn.jsdelivr.net; "
             "style-src 'self' 'unsafe-inline'; "
             "connect-src 'self';"
         )
@@ -338,12 +344,14 @@ async def get_dashboard(username: str = Depends(get_current_username)):
             let lastSpokenText = "";
             let lastSpokenTime = 0;
 
-            // R4-01: 車載ウェイクワード検知
-            let isWakeWordActive = false;
+            // 車載音声コマンド（ウェイクワードの有無に関わらず全音声に自然反応）
             const WAKE_WORDS = ["ジャービス", "jarvis", "ジャビス"];
-            function containsWakeWord(text) {
-                const lower = text.toLowerCase();
-                return WAKE_WORDS.some(word => lower.includes(word));
+            function cleanWakeWords(text) {
+                let cleaned = text;
+                for (const w of WAKE_WORDS) {
+                    cleaned = cleaned.replace(new RegExp(w, "gi"), "");
+                }
+                return cleaned.trim() || text.trim();
             }
 
             // R4-02: 車載高精度音響反響判定アルゴリズム
@@ -427,7 +435,13 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                     statusText.innerText = '周囲の音声を監視中...';
                 } catch (e) {
                     isStarting = false;
-                    if (e.name !== 'NotAllowedError') {
+                    if (e.name === 'InvalidStateError') {
+                        isRecognizing = true;
+                        micBtn.classList.remove('jarvis-btn-thinking');
+                        micBtn.classList.add('jarvis-btn-active');
+                        micBtn.innerText = '🎙️ お話しください...（全音声に反応）';
+                        statusText.innerText = '周囲の音声を監視中...';
+                    } else if (e.name !== 'NotAllowedError') {
                         setTimeout(() => {
                             if (isContinuousMode && !isAiSpeaking && !isAiThinking && !isRecognizing && !isStarting) {
                                 try { isStarting = true; recognition.start(); } catch(_) { isStarting = false; }
@@ -492,21 +506,9 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                         }
                     }
 
-                    // R4-01: 車載ウェイクワード検知
-                    if (!isWakeWordActive) {
-                        if (containsWakeWord(newTranscript)) {
-                            isWakeWordActive = true;
-                            statusText.innerText = "🎙️ JARVISが認識しました。指示をお話しください...";
-                            let cleanedWords = newTranscript;
-                            for (const w of WAKE_WORDS) {
-                                cleanedWords = cleanedWords.replace(new RegExp(w, "gi"), "");
-                            }
-                            newTranscript = cleanedWords.trim();
-                            if (!newTranscript) return;
-                        } else {
-                            return;
-                        }
-                    }
+                    // 全音声入力モード（ウェイクワードがあれば自然に除去）
+                    newTranscript = cleanWakeWords(newTranscript);
+                    if (!newTranscript) return;
                     
                     transcriptBuffer += newTranscript + " ";
                     statusText.innerText = '認識中... (' + transcriptBuffer.trim() + ')';
@@ -598,13 +600,18 @@ async def get_dashboard(username: str = Depends(get_current_username)):
             micBtn.addEventListener('click', () => {
                 isContinuousMode = !isContinuousMode;
                 if(isContinuousMode) {
-                    unlockAudio();
+                    micBtn.classList.remove('jarvis-btn', 'jarvis-btn-thinking');
+                    micBtn.classList.add('jarvis-btn-active');
+                    micBtn.innerText = '🎙️ お話しください...（全音声に反応）';
+                    statusText.innerText = '周囲の音声を監視中...';
+                    try { unlockAudio(); } catch(e) { console.warn(e); }
                     restartRecognitionIfNeeded();
                 } else {
                     if (recognition) {
                         try { recognition.stop(); } catch(e){}
                     }
                     isRecognizing = false;
+                    isStarting = false;
                     micBtn.classList.remove('jarvis-btn-active', 'jarvis-btn-thinking');
                     micBtn.classList.add('jarvis-btn');
                     micBtn.innerText = '🎙️ 常時リスニング開始';
@@ -822,13 +829,12 @@ async def get_dashboard(username: str = Depends(get_current_username)):
 
                 } catch (error) {
                     isAiThinking = false;
-                    contentDiv.innerText += '\n[通信エラー]';
+                    contentDiv.innerText += '\\n[通信エラー]';
                     systemStatus.innerText = 'STATUS: ERROR';
                     statusText.innerText = '通信エラーが発生しました';
                 } finally {
                     input.disabled = false;
                     sendButton.disabled = false;
-                    isWakeWordActive = false;
                     
                     if (isContinuousMode) {
                         micBtn.classList.remove('jarvis-btn-thinking');
