@@ -83,6 +83,17 @@ def extract_prompt_from_content(file_path: str, content: str) -> str:
     return raw_content
 
 
+def sanitize_spoken_summary(text: str) -> str:
+    """車内の社長向けTTS音声合成用にマークダウン記号・装飾を完全に除去し、自然で明瞭な口頭要約に整える"""
+    if not text:
+        return "報告書が完成しました。"
+    cleaned = re.sub(r"```[\s\S]*?```", "", text)
+    cleaned = re.sub(r"\[(.*?)\]\(.*?\)", r"\1", cleaned)
+    cleaned = re.sub(r"[*#`_~\[\]\(\)<>{}\\]", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned if cleaned else "報告書が完成しました。"
+
+
 def clean_and_parse_llm_response(report_text: str) -> tuple[str, str]:
     """LLMの応答テキストから markdown_report と spoken_summary を安全に抽出する"""
     clean_text = report_text.strip() if report_text else ""
@@ -94,7 +105,8 @@ def clean_and_parse_llm_response(report_text: str) -> tuple[str, str]:
         result_json = json.loads(clean_text)
         if isinstance(result_json, dict):
             markdown_content = result_json.get("markdown_report", clean_text)
-            spoken_summary = result_json.get("spoken_summary", "報告書が完成しました。")
+            raw_summary = result_json.get("spoken_summary", "")
+            spoken_summary = sanitize_spoken_summary(raw_summary)
             return markdown_content, spoken_summary
     except Exception:
         pass
@@ -107,7 +119,8 @@ def clean_and_parse_llm_response(report_text: str) -> tuple[str, str]:
             result_json = json.loads(block_inner)
             if isinstance(result_json, dict):
                 markdown_content = result_json.get("markdown_report", clean_text)
-                spoken_summary = result_json.get("spoken_summary", "報告書が完成しました。")
+                raw_summary = result_json.get("spoken_summary", "")
+                spoken_summary = sanitize_spoken_summary(raw_summary)
                 return markdown_content, spoken_summary
         except Exception:
             pass
@@ -120,17 +133,15 @@ def clean_and_parse_llm_response(report_text: str) -> tuple[str, str]:
             result_json = json.loads(bracket_inner)
             if isinstance(result_json, dict):
                 markdown_content = result_json.get("markdown_report", clean_text)
-                spoken_summary = result_json.get("spoken_summary", "報告書が完成しました。")
+                raw_summary = result_json.get("spoken_summary", "")
+                spoken_summary = sanitize_spoken_summary(raw_summary)
                 return markdown_content, spoken_summary
         except Exception:
             pass
 
     # ステップ4: サニタイズ要約フォールバック
     markdown_content = clean_text
-    sanitized = re.sub(r"```[\s\S]*?```", "", clean_text)
-    sanitized = re.sub(r"[#*`>{}\[\]\(\)]", " ", sanitized)
-    sanitized = re.sub(r"\s+", " ", sanitized).strip()
-
+    sanitized = sanitize_spoken_summary(clean_text)
     if sanitized:
         preview = sanitized[:80]
         period_pos = preview.rfind("。")

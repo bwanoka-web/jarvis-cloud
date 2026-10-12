@@ -40,31 +40,42 @@ CATEGORIES = {
 
 EXCLUDE_DIR_PATTERNS = [
     ".*",
-    "venv*",
-    "*venv",
-    "env",
-    "ENV",
+    "*venv*",
+    "*env*",
     "node_modules",
     "__pycache__",
     "*profile*",
-    "*Profile*",
-    "*Session*",
-    "User_Data",
+    "*session*",
+    "*user_data*",
+    "*userdata*",
+    "*chrome*",
+    "*crashpad*",
+    "*shader*",
+    "*gpu*",
+    "*dawn*",
+    "*gate*",
+    "*mancini*",
+    "*leveldb*",
+    "*storage*",
+    "*cache*",
     "debug_screenshots",
-    "Images",
-    "hat_images*",
-    "Product_Images*",
-    "出品",
-    "不要",
-    "cache",
-    "Code Cache",
-    "blob_storage"
+    "*images*",
+    "*image*",
+    "*出品*",
+    "*不要*",
+    "log",
+    "logs",
+    "*_log",
+    "*_logs",
+    "default"
 ]
 
 EXCLUDE_FILE_EXTS = {
     ".pyc", ".pyo", ".pyd", ".exe", ".dll", ".so", ".dylib", ".lib", ".a", ".bin", ".msi",
     ".log", ".tmp", ".bak", ".swp", ".swo", ".ds_store",
-    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4", ".mp3", ".wav", ".zip", ".tar", ".gz", ".7z"
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4", ".mp3", ".wav", ".zip", ".tar", ".gz", ".7z",
+    ".db", ".db-journal", ".db-wal", ".db-shm", ".sqlite", ".sqlite3",
+    ".pkl", ".pickle", ".p"
 }
 
 
@@ -76,12 +87,35 @@ def is_dir_excluded(dirname: str) -> bool:
     return False
 
 
+def is_browser_profile_dir(full_path: str) -> bool:
+    """ディレクトリがブラウザプロファイル・ユーザーデータ領域であるかを動的判定"""
+    if not os.path.isdir(full_path):
+        return False
+    try:
+        entries = set(os.listdir(full_path))
+        signatures = {"Crashpad", "Local State", "Preferences", "Default", "GrShaderCache", "ShaderCache", "Network"}
+        if len(entries.intersection(signatures)) >= 2:
+            return True
+    except OSError:
+        pass
+    return False
+
+
 def is_file_included(filename: str) -> bool:
     flow = filename.lower()
+    # 隠し環境変数・機密設定ファイルを確実に除外
+    if flow.startswith(".env") or flow in {".env", ".env.local", ".env.production", ".env.development"}:
+        return False
+    if flow in {"thumbs.db", ".ds_store", "desktop.ini"}:
+        return False
     ext = os.path.splitext(flow)[1]
     if ext in EXCLUDE_FILE_EXTS:
         return False
-    if flow in {"thumbs.db", ".ds_store"}:
+    # 多重拡張子ログ (例: .log.1, .log.2) の除外
+    if ".log." in flow:
+        return False
+    # ジャーナルやWALファイルの除外
+    if flow.endswith("-journal") or flow.endswith("-wal") or flow.endswith("-shm"):
         return False
     return True
 
@@ -102,8 +136,11 @@ def copy_project(src_dir: str, dest_dir: str) -> tuple[int, int]:
     copied_bytes = 0
 
     for root, dirs, files in os.walk(src_dir):
-        # 除外フォルダーをインプレースで排除
-        dirs[:] = [d for d in dirs if not is_dir_excluded(d)]
+        # 除外フォルダーおよびブラウザプロファイルをインプレースで排除
+        dirs[:] = [
+            d for d in dirs
+            if not is_dir_excluded(d) and not is_browser_profile_dir(os.path.join(root, d))
+        ]
 
         rel_path = os.path.relpath(root, src_dir)
         target_root = dest_dir if rel_path == "." else os.path.join(dest_dir, rel_path)
@@ -154,6 +191,10 @@ def main():
                     "size_mb": 0.0
                 })
                 continue
+
+            # 既存の残骸や漏洩ファイルを除去して完全クリーンコピーを保証
+            if os.path.exists(dest_proj_dir):
+                shutil.rmtree(dest_proj_dir, ignore_errors=True)
 
             print(f"  [COPYING] {resolved_path} -> {dest_proj_dir}")
             files_cnt, bytes_cnt = copy_project(resolved_path, dest_proj_dir)

@@ -52,6 +52,64 @@ class TestWorkerBoostSystem(unittest.TestCase):
         self.assertNotIn("#", spk)
         self.assertNotIn("*", spk)
 
+    def test_spoken_summary_sanitization_removes_markdown(self):
+        # LLMがspoken_summary内に**強調**や#、リンク等のMarkdown記号を含めて出力した場合のサニタイズ検証
+        raw_json = (
+            '{\n'
+            '  "spoken_summary": "**速報**: [新モジュール](http://example.com) の設計が完了しました。`BUYMA`監視を#1方針で即時実行可能です。",\n'
+            '  "markdown_report": "# 詳細レポート本文"\n'
+            '}'
+        )
+        md, spk = worker.clean_and_parse_llm_response(raw_json)
+        self.assertNotIn("*", spk)
+        self.assertNotIn("#", spk)
+        self.assertNotIn("`", spk)
+        self.assertNotIn("[", spk)
+        self.assertNotIn("]", spk)
+        self.assertNotIn("http://", spk)
+        self.assertIn("速報", spk)
+        self.assertIn("新モジュール", spk)
+        self.assertIn("設計が完了しました", spk)
+
+    def test_projects_directory_structure_and_exclusion_safety(self):
+        projects_dir = worker.PROJECTS_DIR
+        self.assertTrue(os.path.exists(projects_dir))
+        self.assertTrue(os.path.isdir(os.path.join(projects_dir, "01_active")))
+        self.assertTrue(os.path.isdir(os.path.join(projects_dir, "02_tools")))
+        self.assertTrue(os.path.isdir(os.path.join(projects_dir, "03_archive")))
+        self.assertTrue(os.path.exists(os.path.join(projects_dir, "PROJECTS_CATALOG.md")))
+
+        # 機密ファイル・ブラウザプロファイル・キャッシュの完全非存在を検証
+        for root, dirs, files in os.walk(projects_dir):
+            for d in dirs:
+                d_low = d.lower()
+                self.assertNotIn("mancini_final_gate", d_low)
+                self.assertNotIn("crashpad", d_low)
+                self.assertNotIn("shadercache", d_low)
+                self.assertNotIn(".venv", d_low)
+                self.assertNotIn("node_modules", d_low)
+                self.assertNotIn("__pycache__", d_low)
+
+            for f in files:
+                f_low = f.lower()
+                self.assertFalse(f_low.startswith(".env"))
+                self.assertFalse(f_low.endswith(".pyc"))
+                self.assertFalse(f_low.endswith(".db-journal"))
+                self.assertFalse(f_low.endswith(".p"))
+                self.assertNotIn(".log.", f_low)
+
+    def test_ignore_files_protect_projects(self):
+        gitignore_path = os.path.join(BASE_DIR, ".gitignore")
+        dockerignore_path = os.path.join(BASE_DIR, ".dockerignore")
+
+        with open(gitignore_path, "r", encoding="utf-8") as f:
+            gi_content = f.read()
+        self.assertIn("projects/", gi_content)
+
+        with open(dockerignore_path, "r", encoding="utf-8") as f:
+            di_content = f.read()
+        self.assertIn("projects/", di_content)
+
 
 if __name__ == "__main__":
     unittest.main()
