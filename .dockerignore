@@ -51,3 +51,6 @@ workspace/requests/*
 workspace/reports/*
 !workspace/requests/.gitkeep
 !workspace/reports/.gitkeep
+
+# projects（ローカル資産・開発プロジェクト除外）
+projects/
