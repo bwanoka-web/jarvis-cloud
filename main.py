@@ -295,7 +295,10 @@ async def get_dashboard(username: str = Depends(get_current_username)):
             </div>
             <div class="flex-1 min-h-[300px] md:min-h-0 overflow-y-auto jarvis-panel p-3 md:p-4 rounded-lg flex flex-col gap-2">
                 <div class="text-sm font-bold border-b border-sky-800 pb-2 mb-2 flex justify-between items-center">
-                    <span>DELIVERABLES VIEWER</span>
+                    <div class="flex items-center gap-2">
+                        <span>DELIVERABLES VIEWER</span>
+                        <button type="button" id="replay-tts-btn" class="text-xs bg-sky-800 hover:bg-sky-700 text-sky-200 px-2 py-1 rounded transition">🔊 全文朗読</button>
+                    </div>
                     <span id="current-report-name" class="text-xs text-sky-400">No active report</span>
                 </div>
                 <div id="markdown-viewer" class="markdown-body text-sm overflow-y-auto">
@@ -618,7 +621,18 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                 }
             });
 
-            function speakText(text, isShortReply = false) {
+            // 長文音声朗読キューエンジン（iOS Safariハングアップ・無音防止対応）
+            let ttsQueue = [];
+            let safariResumeInterval = null;
+
+            function splitIntoSentences(text) {
+                if (!text) return [];
+                const clean = text.replace(/[#*`_>~]/g, '').trim();
+                const parts = clean.split(/[。！？]/);
+                return parts.map(p => p.trim()).filter(p => p.length > 0).map(p => p + "。");
+            }
+
+            function speakText(fullText, isShortReply = false) {
                 if (!ttsToggle.checked) {
                     if (!isShortReply) onAiFinishedSpeaking();
                     else resumeListeningAfterShortReply();
@@ -626,103 +640,128 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                 }
 
                 // 進行中の認識バッファやタイマーをクリアしてエコー誤送信を防止
-                if (speechTimeout) {
-                    clearTimeout(speechTimeout);
-                    speechTimeout = null;
-                }
-                transcriptBuffer = "";
-                input.value = "";
-
-                // エコー防止ステップ1: マイク物理集音を即時停止
-                if (recognition) {
-                    try { recognition.abort(); } catch(e) {}
-                }
+                try {
+                    if (typeof speechTimeout !== 'undefined' && speechTimeout) {
+                        clearTimeout(speechTimeout);
+                        speechTimeout = null;
+                    }
+                    transcriptBuffer = "";
+                    input.value = "";
+                    if (recognition) {
+                        recognition.abort();
+                    }
+                } catch(e) {}
                 isRecognizing = false;
 
                 isAiSpeaking = true;
-                lastSpokenText = text;
+                lastSpokenText = fullText;
                 lastSpokenTime = Date.now();
 
                 micBtn.classList.remove('jarvis-btn-active');
                 micBtn.classList.add('jarvis-btn-thinking');
                 micBtn.innerText = '🔊 JARVIS 発話中...';
-                statusText.innerText = '報告書を読み上げ中（マイク停止中）';
-                
-                const utterance = new SpeechSynthesisUtterance(text);
-                utterance.lang = 'ja-JP';
-                utterance.rate = 1.1; 
-                utterance.pitch = 0.9;
-                window.currentUtterance = utterance;
+                statusText.innerText = '報告書を音声解説中（マイク一時停止）';
 
-                const cleanupAndFinish = () => {
+                // 再生キューの作成
+                ttsQueue = splitIntoSentences(fullText);
+                if (ttsQueue.length === 0) {
+                    onAiFinishedSpeaking();
+                    return;
+                }
+
+                // Safariの再生15秒停止バグを防止する定期resume
+                if (safariResumeInterval) clearInterval(safariResumeInterval);
+                safariResumeInterval = setInterval(() => {
+                    if (window.speechSynthesis && window.speechSynthesis.speaking) {
+                        try { window.speechSynthesis.resume(); } catch(_) {}
+                    }
+                }, 4000);
+
+                try { window.speechSynthesis.cancel(); } catch(_) {}
+
+                // 再生開始
+                playNextSentence(isShortReply);
+            }
+
+            function playNextSentence(isShortReply) {
+                if (!isAiSpeaking) return;
+
+                if (ttsQueue.length === 0) {
+                    // 全文再生完了
+                    if (safariResumeInterval) {
+                        clearInterval(safariResumeInterval);
+                        safariResumeInterval = null;
+                    }
                     if (ttsSafetyTimer) {
                         clearTimeout(ttsSafetyTimer);
                         ttsSafetyTimer = null;
                     }
                     window.currentUtterance = null;
-                    onAiFinishedSpeaking();
+                    if (!isShortReply) onAiFinishedSpeaking();
+                    else resumeListeningAfterShortReply();
+                    return;
+                }
+
+                const sentence = ttsQueue.shift();
+                const utterance = new SpeechSynthesisUtterance(sentence);
+                utterance.lang = 'ja-JP';
+                utterance.rate = 1.05;
+                utterance.pitch = 0.95;
+                window.currentUtterance = utterance;
+
+                // 自然な日本語音声の選定
+                const voices = window.speechSynthesis.getVoices();
+                const jpVoices = voices.filter(v => v.lang.includes('ja'));
+                if (jpVoices.length > 0) {
+                    const bestVoice = jpVoices.find(v => 
+                        v.name.includes('Google') || 
+                        v.name.includes('Premium') || 
+                        v.name.includes('Nanami') || 
+                        v.name.includes('Kyoko')
+                    );
+                    utterance.voice = bestVoice || jpVoices[0];
+                }
+
+                let isSentenceDone = false;
+                const nextStep = () => {
+                    if (isSentenceDone) return;
+                    isSentenceDone = true;
+                    setTimeout(() => playNextSentence(isShortReply), 80);
                 };
 
-                utterance.onend = cleanupAndFinish;
+                utterance.onend = nextStep;
                 utterance.onerror = (e) => {
-                    console.error("TTS Error:", e);
-                    cleanupAndFinish();
+                    console.warn("TTS sentence error:", e);
+                    nextStep();
                 };
 
-                const doSpeak = () => {
-                    if (window.speechSynthesis.speaking || window.speechSynthesis.pending) {
-                        try { window.speechSynthesis.cancel(); } catch(_) {}
+                // 文ごとのタイムアウトガード（iOSの無音ハングアップ防止）
+                const maxSentenceDuration = Math.max(3000, sentence.length * 350 + 2000);
+                setTimeout(() => {
+                    if (!isSentenceDone && isAiSpeaking) {
+                        console.warn("TTS sentence timeout, proceeding to next.");
+                        nextStep();
                     }
-                    const voices = window.speechSynthesis.getVoices();
-                    const jpVoices = voices.filter(v => v.lang.includes('ja'));
-                    if (jpVoices.length > 0) {
-                        const bestVoice = jpVoices.find(v => 
-                            v.name.includes('Google') || 
-                            v.name.includes('Premium') || 
-                            v.name.includes('Nanami') || 
-                            v.name.includes('Kyoko')
-                        );
-                        utterance.voice = bestVoice || jpVoices[0];
-                    }
+                }, maxSentenceDuration);
+
+                try {
                     window.speechSynthesis.speak(utterance);
-
-                    // ハングアップ救済フェイルセーフタイマー
-                    const maxDuration = Math.max(3000, text.length * 250 + 2000);
-                    ttsSafetyTimer = setTimeout(() => {
-                        if (isAiSpeaking) {
-                            console.warn("TTS timeout reached. Recovering microphone state.");
-                            cleanupAndFinish();
-                        }
-                    }, maxDuration);
-                };
-
-                if (window.speechSynthesis.getVoices().length === 0) {
-                    let called = false;
-                    const onVoicesLoaded = () => {
-                        if (called) return;
-                        called = true;
-                        window.speechSynthesis.removeEventListener('voiceschanged', onVoicesLoaded);
-                        doSpeak();
-                    };
-                    window.speechSynthesis.addEventListener('voiceschanged', onVoicesLoaded);
-                    setTimeout(() => {
-                        if (!called) {
-                            called = true;
-                            window.speechSynthesis.removeEventListener('voiceschanged', onVoicesLoaded);
-                            doSpeak();
-                        }
-                    }, 1000);
-                } else {
-                    doSpeak();
+                } catch(err) {
+                    console.error("speechSynthesis.speak failed:", err);
+                    nextStep();
                 }
             }
 
             function onAiFinishedSpeaking() {
                 if (!isAiSpeaking) return;
                 lastSpokenTime = Date.now();
+                if (safariResumeInterval) {
+                    clearInterval(safariResumeInterval);
+                    safariResumeInterval = null;
+                }
                 if (micCooldownTimer) clearTimeout(micCooldownTimer);
 
-                // エコー防止ステップ2: スピーカー残響回避のためのクールダウン（1000ms）
+                // エコー防止: スピーカー残響回避のためのクールダウン（1000ms）
                 micCooldownTimer = setTimeout(() => {
                     isAiSpeaking = false;
                     transcriptBuffer = "";
@@ -783,6 +822,17 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                     }
                 } catch(err) {}
                 isRecognizing = false;
+                hasPendingRequest = true;
+
+                // iOS Safari オーディオパイプラインの事前活性化（回答受信時の無音防止）
+                try {
+                    unlockAudio();
+                    if (window.speechSynthesis) {
+                        const prime = new SpeechSynthesisUtterance(' ');
+                        prime.volume = 0.01;
+                        window.speechSynthesis.speak(prime);
+                    }
+                } catch(_) {}
 
                 isAiThinking = true;
 
@@ -873,12 +923,15 @@ async def get_dashboard(username: str = Depends(get_current_username)):
             let lastReportFilename = '';
             let lastReportContent = '';
             let isInitialReportLoad = true;
+            let hasPendingRequest = false;
+
             setInterval(async () => {
                 try {
                     const res = await fetch('/api/latest_report');
                     if (res.ok) {
                         const data = await res.json();
                         if (data.filename && (data.filename !== lastReportFilename || data.content !== lastReportContent)) {
+                            const isNewReport = (lastReportFilename !== '' && data.filename !== lastReportFilename);
                             lastReportFilename = data.filename;
                             lastReportContent = data.content;
                             document.getElementById('current-report-name').innerText = data.filename;
@@ -886,15 +939,15 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                             const rawHtml = marked.parse(data.content);
                             const sanitizedHtml = DOMPurify.sanitize(rawHtml);
                             document.getElementById('markdown-viewer').innerHTML = sanitizedHtml;
-                            if (!isInitialReportLoad) {
-                                if (data.spoken_summary) {
+
+                            // 新着レポート、またはユーザーが指示を出して待機していた場合は必ず全文朗読
+                            if (!isInitialReportLoad || isNewReport || hasPendingRequest) {
+                                hasPendingRequest = false;
+                                if (data.spoken_summary && data.spoken_summary.trim().length > 0) {
                                     speakText(data.spoken_summary, false);
                                 } else {
-                                    let plainText = data.content.replace(/[#*>-]/g, "").trim();
-                                    if (plainText.length > 250) {
-                                        plainText = plainText.substring(0, 250) + "。以下省略します。";
-                                    }
-                                    speakText("報告書が完成しました。内容を読み上げます。" + plainText, false);
+                                    let plainText = data.content.replace(/[#*`_>~]/g, "").trim();
+                                    speakText("調査が完了しました。ご報告いたします。" + plainText, false);
                                 }
                             }
                         }
@@ -911,6 +964,19 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                     restartRecognitionIfNeeded();
                 }
             }, 4000);
+
+            // 手動レポート全文朗読ボタン
+            const replayBtn = document.getElementById('replay-tts-btn');
+            if (replayBtn) {
+                replayBtn.addEventListener('click', () => {
+                    if (lastReportContent) {
+                        let textToRead = lastReportContent.replace(/[#*`_>~]/g, "").trim();
+                        speakText("最新レポートを読み上げます。" + textToRead, false);
+                    } else {
+                        speakText("現在、読み上げるレポートがありません。", true);
+                    }
+                });
+            }
         </script>
     </body>
     </html>
