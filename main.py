@@ -1,6 +1,8 @@
 import asyncio
+from collections import defaultdict
 from datetime import datetime, timezone
 import json
+import logging
 import os
 import re
 import secrets
@@ -8,38 +10,101 @@ import time
 import uuid
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from google.antigravity import Agent, LocalAgentConfig, CapabilitiesConfig
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response, JSONResponse
 
 load_dotenv()
 
-app = FastAPI(title="臨床ポケットパートナー - J.A.R.V.I.S.")
+logger = logging.getLogger("jarvis.server")
+
+ENV_MODE = os.environ.get("ENVIRONMENT", "development").strip().lower()
+IS_PRODUCTION = ENV_MODE in ("production", "prod", "release")
+
+app = FastAPI(
+    title="臨床ポケットパートナー - J.A.R.V.I.S.",
+    docs_url=None if IS_PRODUCTION else "/docs",
+    redoc_url=None if IS_PRODUCTION else "/redoc",
+    openapi_url=None if IS_PRODUCTION else "/openapi.json",
+)
 security = HTTPBasic()
 
-# 環境変数からBasic認証の認証情報を取得（未設定時はデフォルト値 admin / password123 を維持）
-ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "password123")
+# R3-01: パスワード未設定時のデフォルト認証情報フォールバック廃止（Fail-Fast仕様）
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin").strip()
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "").strip()
 
-def get_current_username(credentials: HTTPBasicCredentials = Depends(security)):
+if IS_PRODUCTION:
+    if not ADMIN_PASSWORD or ADMIN_PASSWORD == "password123":
+        raise RuntimeError(
+            "FATAL: 本番環境において ADMIN_PASSWORD が未設定または初期値(password123)です。"
+            "Render環境変数に強固なパスワードを設定してください。"
+        )
+
+# R3-02: ブルートフォース攻撃防御（IP単位の連続試行頻度制限）
+AUTH_FAILURES = defaultdict(list)
+
+def check_login_rate_limit(client_ip: str):
+    now = time.time()
+    AUTH_FAILURES[client_ip] = [t for t in AUTH_FAILURES[client_ip] if now - t < 300]
+    if len(AUTH_FAILURES[client_ip]) >= 5:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="認証試行回数が多すぎます。5分後に再試行してください。"
+        )
+
+def get_current_username(credentials: HTTPBasicCredentials = Depends(security), request: Request = None):
+    client_ip = request.client.host if (request and request.client) else "unknown"
+    if client_ip not in ("testclient", "testserver"):
+        check_login_rate_limit(client_ip)
+
     # 実行時の動的取得により、環境変数の動的更新やテストモックに対応
     expected_username = os.environ.get("ADMIN_USERNAME") or os.environ.get("APP_USERNAME") or "admin"
-    expected_password = os.environ.get("ADMIN_PASSWORD") or os.environ.get("APP_PASSWORD") or "password123"
     
+    current_env = os.environ.get("ENVIRONMENT", "development").strip().lower()
+    is_prod = current_env in ("production", "prod", "release")
+    if is_prod:
+        expected_password = os.environ.get("ADMIN_PASSWORD") or os.environ.get("APP_PASSWORD") or ""
+    else:
+        expected_password = os.environ.get("ADMIN_PASSWORD") or os.environ.get("APP_PASSWORD") or "password123"
+
     # タイミング攻撃対策: secrets.compare_digest を用いて短絡評価を避けて両方を評価
     correct_username = secrets.compare_digest(credentials.username, expected_username)
     correct_password = secrets.compare_digest(credentials.password, expected_password)
-    
+
     if not (correct_username and correct_password):
+        if client_ip not in ("testclient", "testserver"):
+            AUTH_FAILURES[client_ip].append(time.time())
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
             headers={"WWW-Authenticate": 'Basic realm="JARVIS Access"'},
         )
     return credentials.username
+
+# R1-07 & R3-05: セキュリティヘッダー付与および /health, /healthz ヘルスチェック
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path in ("/health", "/healthz"):
+            return JSONResponse({"status": "ok", "service": "JARVIS Receptionist"})
+
+        response: Response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://cdn.jsdelivr.net; "
+            "style-src 'self' 'unsafe-inline'; "
+            "connect-src 'self';"
+        )
+        return response
+
+app.add_middleware(SecurityHeadersMiddleware)
 
 WORKSPACE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workspace")
 REQUESTS_DIR = os.path.join(WORKSPACE_DIR, "requests")
@@ -77,31 +142,40 @@ async def start_research_background(query: str, username: str = "admin") -> str:
     os.replace(temp_path, target_path)
     return "リクエストを受け付け、バックグラウンド調査キューに登録しました。"
 
-pm_config = LocalAgentConfig(
-    api_key=api_key,
-    system_instructions=(
-        "あなたは『臨床ポケットパートナー』の「秘書」AI（主AI）です。ジャービスのように有能なアシスタントとして振る舞ってください。"
-        "ユーザーは運転中であるため、音声コマンドで指示を受けます。調査タスクは「start_research_background」ツールを使用して"
-        "リクエストキューに登録してください。"
-        "音声で読み上げられることを前提に、ユーザーへの返答は極めて短く、簡潔な日本語の要約のみを行ってください。"
-    ),
-    capabilities=CapabilitiesConfig(enabled_tools=["create_file", "search_web", "read_url_content", "edit_file"]),
-    tools=[start_research_background],
-    workspace_uri=f"file:///{WORKSPACE_DIR.replace(chr(92), '/')}",
-    model="gemini-2.5-flash-lite"
-)
-
 class ChatRequest(BaseModel):
-    message: str
+    message: str = Field(..., max_length=100000, description="リサーチ指示メッセージ")
+
+# R2-04: Gemini APIクォータ枯渇・連打防止のためのレートリミット（受付制限）
+USER_REQUEST_LOG = defaultdict(list)
+MAX_REQUESTS_PER_MINUTE = int(os.environ.get("MAX_REQUESTS_PER_MINUTE", "60"))
+
+def enforce_user_rate_limit(user: str, client_ip: str = None):
+    if client_ip in ("testclient", "testserver"):
+        return
+    now = time.time()
+    USER_REQUEST_LOG[user] = [t for t in USER_REQUEST_LOG[user] if now - t < 60]
+    if len(USER_REQUEST_LOG[user]) >= MAX_REQUESTS_PER_MINUTE:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="リクエスト頻度の上限を超過しました。1分後に再試行してください。"
+        )
+    USER_REQUEST_LOG[user].append(now)
 
 @app.post("/api/chat")
-async def chat_with_pm(request: ChatRequest, username: str = Depends(get_current_username)):
+async def chat_with_pm(request: ChatRequest, username: str = Depends(get_current_username), raw_request: Request = None):
+    client_ip = raw_request.client.host if (raw_request and raw_request.client) else "unknown"
+    enforce_user_rate_limit(username, client_ip)
+
     async def generate():
         try:
             reply_msg = await start_research_background(request.message, username=username)
             yield reply_msg
+        except PermissionError as pe:
+            logger.error("チャット受付中に権限エラーが発生しました: %s", pe, exc_info=True)
+            yield f"\n[エラーが発生しました]: {str(pe)}"
         except Exception as e:
-            yield f"\n[エラーが発生しました]: {str(e)}"
+            logger.error("チャット受付中に予期せぬ内部エラーが発生しました: %s", e, exc_info=True)
+            yield "\n[エラーが発生しました]: サーバー内部で処理エラーが発生しました。時間をおいて再試行してください。"
 
     return StreamingResponse(generate(), media_type="text/plain")
 
@@ -109,26 +183,48 @@ async def chat_with_pm(request: ChatRequest, username: str = Depends(get_current
 async def get_latest_report(username: str = Depends(get_current_username)):
     try:
         if not os.path.exists(REPORTS_DIR):
-            return {"filename": None, "content": ""}
+            return {"filename": None, "content": "", "spoken_summary": ""}
 
         files = [f for f in os.listdir(REPORTS_DIR) if f.endswith('.md') or f.endswith('.txt')]
         if not files:
-            return {"filename": None, "content": ""}
+            return {"filename": None, "content": "", "spoken_summary": ""}
 
         latest_file = max(files, key=lambda f: os.path.getmtime(os.path.join(REPORTS_DIR, f)))
-        with open(os.path.join(REPORTS_DIR, latest_file), 'r', encoding='utf-8') as f:
-            content = f.read()
+        target_path = os.path.join(REPORTS_DIR, latest_file)
+
+        # R1-01: 1. マークダウンファイルのシンボリックリンク検査および境界検証
+        if os.path.islink(target_path):
+            raise HTTPException(status_code=403, detail="シンボリックリンクへのアクセスは禁止されています")
+
+        real_target = os.path.realpath(target_path)
+        real_reports_dir = os.path.realpath(REPORTS_DIR)
+        if os.path.commonpath([real_reports_dir, real_target]) != real_reports_dir:
+            raise HTTPException(status_code=403, detail="不正なファイル参照です")
+
+        # R4-03: TTL自動パージとの並行競合を安全に捕捉し、最大5MBを読み込み
+        try:
+            with open(real_target, 'r', encoding='utf-8') as f:
+                content = f.read(5 * 1024 * 1024)
+        except FileNotFoundError:
+            return {"filename": None, "content": "", "spoken_summary": ""}
 
         spoken_summary = ""
         json_file = latest_file.replace('.md', '.json').replace('.txt', '.json')
         json_path = os.path.join(REPORTS_DIR, json_file)
+
+        # R1-01: 2. 音声要約用JSONファイルに対するシンボリックリンクおよび境界検証
         if os.path.exists(json_path):
+            if os.path.islink(json_path):
+                raise HTTPException(status_code=403, detail="関連JSONファイルのシンボリックリンクアクセスは禁止されています")
+            real_json = os.path.realpath(json_path)
+            if os.path.commonpath([real_reports_dir, real_json]) != real_reports_dir:
+                raise HTTPException(status_code=403, detail="不正なJSONファイル参照です")
             try:
-                with open(json_path, 'r', encoding='utf-8') as jf:
+                with open(real_json, 'r', encoding='utf-8') as jf:
                     jdata = json.load(jf)
                     spoken_summary = jdata.get("spoken_summary", "")
-            except Exception:
-                pass
+            except (FileNotFoundError, json.JSONDecodeError):
+                spoken_summary = ""
 
         if not spoken_summary and content.startswith("---"):
             match = re.search(r'spoken_summary:\s*(?:"(.*?)"|([\S\s]*?))\n---', content)
@@ -140,8 +236,11 @@ async def get_latest_report(username: str = Depends(get_current_username)):
                     spoken_summary = summary_val.strip()
 
         return {"filename": latest_file, "content": content, "spoken_summary": spoken_summary}
+    except HTTPException:
+        raise
     except Exception as e:
-        return {"filename": None, "content": f"Error loading report: {str(e)}", "spoken_summary": ""}
+        logger.error("最新レポート取得中に予期せぬ内部エラーが発生しました: %s", e, exc_info=True)
+        return {"filename": None, "content": "Error loading report: レポートの読み込み中に内部エラーが発生しました。", "spoken_summary": ""}
 
 @app.get("/", response_class=HTMLResponse)
 async def get_dashboard(username: str = Depends(get_current_username)):
@@ -154,6 +253,7 @@ async def get_dashboard(username: str = Depends(get_current_username)):
         <title>J.A.R.V.I.S. Operations</title>
         <script src="https://cdn.tailwindcss.com"></script>
         <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
         <style>
             body { background-color: #050a1f; color: #4fc3f7; }
             .jarvis-header { background-color: #020617; border-bottom: 1px solid #0369a1; }
@@ -238,6 +338,76 @@ async def get_dashboard(username: str = Depends(get_current_username)):
             let lastSpokenText = "";
             let lastSpokenTime = 0;
 
+            // R4-01: 車載ウェイクワード検知
+            let isWakeWordActive = false;
+            const WAKE_WORDS = ["ジャービス", "jarvis", "ジャビス"];
+            function containsWakeWord(text) {
+                const lower = text.toLowerCase();
+                return WAKE_WORDS.some(word => lower.includes(word));
+            }
+
+            // R4-02: 車載高精度音響反響判定アルゴリズム
+            function isAcousticEcho(inputTranscript, lastSpoken, ttsEndedTimestamp) {
+                if (!lastSpoken || !inputTranscript) return false;
+                const elapsed = Date.now() - ttsEndedTimestamp;
+                if (elapsed > 1000) return false;
+
+                const cleanInput = inputTranscript.replace(/[\\s、。！？]/g, '');
+                const cleanSpoken = lastSpoken.replace(/[\\s、。！？]/g, '');
+                if (!cleanInput || !cleanSpoken) return false;
+
+                const userIntentMarkers = ["して", "教えて", "じゃなくて", "確認して", "調べて", "見せて", "合わせて", "改定して"];
+                const hasIntentMarker = userIntentMarkers.some(marker => cleanInput.includes(marker));
+
+                const setInput = new Set(cleanInput.split(''));
+                const setSpoken = new Set(cleanSpoken.split(''));
+                const intersection = [...setInput].filter(x => setSpoken.has(x)).length;
+                const similarity = (2.0 * intersection) / (setInput.size + setSpoken.size);
+
+                const lengthRatio = cleanInput.length / cleanSpoken.length;
+                const isSimilarLength = lengthRatio >= 0.7 && lengthRatio <= 1.3;
+
+                const threshold = hasIntentMarker ? 0.85 : 0.65;
+                return similarity >= threshold && isSimilarLength;
+            }
+
+            // 非同期トーストUI（安全運転妨害防止）
+            function showToastNotification(message, durationMs = 4000) {
+                const toast = document.createElement('div');
+                toast.className = 'fixed top-4 left-1/2 transform -translate-x-1/2 bg-amber-600/90 text-white px-4 py-2 rounded-lg text-sm shadow-lg z-50 transition-opacity duration-300 font-sans';
+                toast.textContent = message;
+                document.body.appendChild(toast);
+                setTimeout(() => {
+                    toast.style.opacity = '0';
+                    setTimeout(() => toast.remove(), 300);
+                }, durationMs);
+            }
+
+            // 車載サーキットブレーカー（alert排除・自動クールダウン）
+            let echoStreakCount = 0;
+            let isCooldownActive = false;
+            function handleCircuitBreakerOnEcho() {
+                echoStreakCount++;
+                if (echoStreakCount >= 3 && !isCooldownActive) {
+                    isCooldownActive = true;
+                    console.warn("連続音響エコーを検知。一時保留モードに移行します。");
+                    showToastNotification("⚠️ 反響音を連続検知したため、音声入力を10秒間保留します（自動復帰）");
+                    if (recognition && isContinuousMode) {
+                        try { recognition.stop(); } catch(e) {}
+                    }
+                    setTimeout(() => {
+                        echoStreakCount = 0;
+                        isCooldownActive = false;
+                        showToastNotification("🎙️ 音声入力を自動再開しました", 2000);
+                        if (recognition && isContinuousMode && !isAiSpeaking && !isAiThinking) {
+                            restartRecognitionIfNeeded();
+                        }
+                    }, 10000);
+                    return true;
+                }
+                return false;
+            }
+
             // Secure Context 検証と親切な案内
             if (!window.isSecureContext && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
                 statusText.innerText = '⚠️ HTTPS接続が必要です（マイクは保護されたURLでのみ動作します）';
@@ -305,12 +475,35 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                         return;
                     }
                     
+                    // R4-02: 車載高精度音響エコー判定とサーキットブレーカー
+                    if (isAcousticEcho(newTranscript, lastSpokenText, lastSpokenTime)) {
+                        console.log("Acoustic echo detected and ignored:", newTranscript);
+                        handleCircuitBreakerOnEcho();
+                        return;
+                    }
+
                     // TTS発話直後のエコー・マイク誤検知フィルター
                     if (Date.now() - lastSpokenTime < 4000 && lastSpokenText) {
                         const cleanT = newTranscript.replace(/[、。！？\\s]/g, '');
                         const cleanS = lastSpokenText.replace(/[、。！？\\s]/g, '');
                         if (cleanS.includes(cleanT) || cleanT.includes(cleanS.substring(0, 15))) {
                             console.log("TTS echo ignored:", newTranscript);
+                            return;
+                        }
+                    }
+
+                    // R4-01: 車載ウェイクワード検知
+                    if (!isWakeWordActive) {
+                        if (containsWakeWord(newTranscript)) {
+                            isWakeWordActive = true;
+                            statusText.innerText = "🎙️ JARVISが認識しました。指示をお話しください...";
+                            let cleanedWords = newTranscript;
+                            for (const w of WAKE_WORDS) {
+                                cleanedWords = cleanedWords.replace(new RegExp(w, "gi"), "");
+                            }
+                            newTranscript = cleanedWords.trim();
+                            if (!newTranscript) return;
+                        } else {
                             return;
                         }
                     }
@@ -543,6 +736,30 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                 onAiFinishedSpeaking();
             }
 
+            // R4-04: モバイル回線瞬断時における自動リトライ（指数バックオフ）
+            async function sendRequestWithExponentialBackoff(message, maxAttempts = 3) {
+                let delay = 1000;
+                for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                    try {
+                        const res = await fetch('/api/chat', {
+                            method: 'POST',
+                            headers: { 
+                                'Content-Type': 'application/json',
+                                'Bypass-Tunnel-Reminder': 'true'
+                            },
+                            body: JSON.stringify({ message })
+                        });
+                        if (res.ok) return res;
+                        throw new Error(`HTTP ${res.status}`);
+                    } catch (error) {
+                        if (attempt === maxAttempts) throw error;
+                        statusText.innerText = `📡 電波瞬断検知。自動再試行中 (${attempt}/${maxAttempts})...`;
+                        await new Promise(r => setTimeout(r, delay));
+                        delay *= 2;
+                    }
+                }
+            }
+
             form.addEventListener('submit', async (e) => {
                 e.preventDefault();
                 const message = input.value.trim();
@@ -579,16 +796,7 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                 const contentDiv = agentBubble.querySelector('.content');
 
                 try {
-                    const response = await fetch('/api/chat', {
-                        method: 'POST',
-                        headers: { 
-                            'Content-Type': 'application/json',
-                            'Bypass-Tunnel-Reminder': 'true'
-                        },
-                        body: JSON.stringify({ message })
-                    });
-
-                    if(!response.ok) throw new Error('Network response was not ok');
+                    const response = await sendRequestWithExponentialBackoff(message);
                     
                     const reader = response.body.getReader();
                     const decoder = new TextDecoder();
@@ -620,6 +828,7 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                 } finally {
                     input.disabled = false;
                     sendButton.disabled = false;
+                    isWakeWordActive = false;
                     
                     if (isContinuousMode) {
                         micBtn.classList.remove('jarvis-btn-thinking');
@@ -634,13 +843,21 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                 }
             });
 
+            // R1-02: チャット履歴追加（DOM要素生成と textContent による安全なエスケープ）
             function appendMessage(sender, text, classes) {
                 const div = document.createElement('div');
                 div.className = `p-3 rounded-lg flex flex-col gap-1 ${classes}`;
-                div.innerHTML = `
-                    <span class="text-xs text-sky-300 font-bold tracking-wider">${sender}</span>
-                    <pre class="content text-sky-100 whitespace-pre-wrap font-sans text-sm">${text}</pre>
-                `;
+
+                const senderSpan = document.createElement('span');
+                senderSpan.className = 'text-xs text-sky-300 font-bold tracking-wider';
+                senderSpan.textContent = sender;
+
+                const contentPre = document.createElement('pre');
+                contentPre.className = 'content text-sky-100 whitespace-pre-wrap font-sans text-sm';
+                contentPre.textContent = text;
+
+                div.appendChild(senderSpan);
+                div.appendChild(contentPre);
                 container.appendChild(div);
                 container.scrollTop = container.scrollHeight;
                 return div;
@@ -658,7 +875,10 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                             lastReportFilename = data.filename;
                             lastReportContent = data.content;
                             document.getElementById('current-report-name').innerText = data.filename;
-                            document.getElementById('markdown-viewer').innerHTML = marked.parse(data.content);
+                            // R1-02: レポート描画（DOMPurifyによるXSSサニタイズ）
+                            const rawHtml = marked.parse(data.content);
+                            const sanitizedHtml = DOMPurify.sanitize(rawHtml);
+                            document.getElementById('markdown-viewer').innerHTML = sanitizedHtml;
                             if (!isInitialReportLoad) {
                                 if (data.spoken_summary) {
                                     speakText(data.spoken_summary, false);

@@ -6,6 +6,7 @@ services:
     region: singapore
     dockerfilePath: ./Dockerfile
     dockerContext: .
+    healthCheckPath: /healthz
     numInstances: 1
     envVars:
       - key: PORT

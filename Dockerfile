@@ -46,7 +46,9 @@ RUN mkdir -p /app/workspace/requests \
              /app/workspace/reports \
              /var/log/supervisor \
              /tmp && \
-    chown -R appuser:appuser /app /var/log/supervisor /tmp
+    chown -R appuser:appuser /app /var/log/supervisor /tmp && \
+    chmod 555 /app/*.py && \
+    chmod 750 /app/workspace/requests /app/workspace/reports
 
 # 8. entrypoint.sh のパーミッション設定およびWindows CRLF改行コードのLF変換
 RUN chmod +x /app/entrypoint.sh && \
@@ -61,7 +63,7 @@ EXPOSE 8000
 # 11. ヘルスチェック定義
 # 起動から10秒後に初回チェック、以降30秒間隔でFastAPIのエンドポイントを監視
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:${PORT}/docs || exit 1
+    CMD curl -f http://localhost:${PORT}/health || exit 1
 
 # 12. entrypoint スクリプトの実行
 ENTRYPOINT ["/app/entrypoint.sh"]
