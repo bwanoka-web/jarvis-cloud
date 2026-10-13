@@ -164,10 +164,51 @@ class TestWorkerBoostSystem(unittest.TestCase):
             main.normalize_voice_query("臨終ポケットパートナーについて"),
             "臨床ポケットパートナーについて"
         )
+        # 空白混入（半角・全角）パターンの正規化
+        self.assertEqual(
+            main.normalize_voice_query("認証 ポケット パートナーのターゲットは？"),
+            "臨床ポケットパートナーのターゲットは？"
+        )
+        self.assertEqual(
+            main.normalize_voice_query("認証　ポケット　パートナーのターゲットは？"),
+            "臨床ポケットパートナーのターゲットは？"
+        )
+        # ひらがな・カタカナ誤認識パターンの正規化
+        self.assertEqual(
+            main.normalize_voice_query("にんしょうポケットパートナーのターゲットは？"),
+            "臨床ポケットパートナーのターゲットは？"
+        )
+        self.assertEqual(
+            main.normalize_voice_query("ニンショウポケットパートナーのターゲットは？"),
+            "臨床ポケットパートナーのターゲットは？"
+        )
+        self.assertEqual(
+            main.normalize_voice_query("認証パートナーについて教えて"),
+            "臨床ポケットパートナーについて教えて"
+        )
+        # ユーザーの実発話シナリオ（短め指定付き）の正規化
+        self.assertEqual(
+            main.normalize_voice_query("認証ポケットパートナーのターゲットはどのように把握していますか短めでいいんで教えてください"),
+            "臨床ポケットパートナーのターゲットはどのように把握していますか短めでいいんで教えてください"
+        )
         # 影響のない文変数は維持される
         self.assertEqual(
             main.normalize_voice_query("BUYMAの在庫監視状況"),
             "BUYMAの在庫監視状況"
+        )
+        self.assertEqual(
+            main.normalize_voice_query("認証テスト"),
+            "認証テスト"
+        )
+
+    def test_worker_voice_normalization_logic(self):
+        self.assertEqual(
+            worker.normalize_voice_query("認証ポケットパートナーのターゲットは？短めで"),
+            "臨床ポケットパートナーのターゲットは？短めで"
+        )
+        self.assertEqual(
+            worker.normalize_voice_query("にんしょう ポケット パートナー"),
+            "臨床ポケットパートナー"
         )
 
 

@@ -153,14 +153,11 @@ class ChatRequest(BaseModel):
 
 # 音声認識の同音・音韻誤認に対する正規化マッピング辞書
 VOICE_NORMALIZATION_MAP = {
-    r"認証ポケットパートナー": "臨床ポケットパートナー",
-    r"認証ポケット": "臨床ポケット",
-    r"輪唱ポケットパートナー": "臨床ポケットパートナー",
-    r"輪唱ポケット": "臨床ポケット",
-    r"認承ポケットパートナー": "臨床ポケットパートナー",
-    r"認承ポケット": "臨床ポケット",
-    r"臨終ポケットパートナー": "臨床ポケットパートナー",
-    r"臨終ポケット": "臨床ポケット",
+    r"(?:認証|認承|輪唱|臨終|人称|にんしょう|ニンショウ)\s*ポケット\s*パートナー": "臨床ポケットパートナー",
+    r"(?:認証|認承|輪唱|臨終|人称|にんしょう|ニンショウ)\s*ポケット": "臨床ポケット",
+    r"(?:認証|認承|輪唱|臨終|人称|にんしょう|ニンショウ)\s*パートナー": "臨床ポケットパートナー",
+    r"臨床\s*ポケット\s*パートナー": "臨床ポケットパートナー",
+    r"臨床\s*ポケット": "臨床ポケット",
 }
 
 def normalize_voice_query(text: str) -> str:
@@ -384,14 +381,11 @@ async def get_dashboard(username: str = Depends(get_current_username)):
 
             // 音声認識の同音・音韻誤認辞書マッピング（走行ノイズ耐性）
             const SPEECH_NORMALIZATION_MAP = [
-                { pattern: /認証ポケットパートナー/g, replacement: "臨床ポケットパートナー" },
-                { pattern: /認証ポケット/g, replacement: "臨床ポケット" },
-                { pattern: /輪唱ポケットパートナー/g, replacement: "臨床ポケットパートナー" },
-                { pattern: /輪唱ポケット/g, replacement: "臨床ポケット" },
-                { pattern: /認承ポケットパートナー/g, replacement: "臨床ポケットパートナー" },
-                { pattern: /認承ポケット/g, replacement: "臨床ポケット" },
-                { pattern: /臨終ポケットパートナー/g, replacement: "臨床ポケットパートナー" },
-                { pattern: /臨終ポケット/g, replacement: "臨床ポケット" }
+                { pattern: /(?:認証|認承|輪唱|臨終|人称|にんしょう|ニンショウ)\\s*ポケット\\s*パートナー/g, replacement: "臨床ポケットパートナー" },
+                { pattern: /(?:認証|認承|輪唱|臨終|人称|にんしょう|ニンショウ)\\s*ポケット/g, replacement: "臨床ポケット" },
+                { pattern: /(?:認証|認承|輪唱|臨終|人称|にんしょう|ニンショウ)\\s*パートナー/g, replacement: "臨床ポケットパートナー" },
+                { pattern: /臨床\\s*ポケット\\s*パートナー/g, replacement: "臨床ポケットパートナー" },
+                { pattern: /臨床\\s*ポケット/g, replacement: "臨床ポケット" }
             ];
 
             function normalizeSpeechText(text) {

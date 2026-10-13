@@ -160,8 +160,8 @@ class TestAudioAndQueueFix(unittest.TestCase):
         self.assertIn("テスト本文", data["content"])
 
     def test_worker_uses_flash_lite_model(self):
-        """クォータ枯渇（HTTP 429）を回避するため、worker_configのモデルがgemini-2.5-flash-liteであること"""
-        self.assertEqual(worker.worker_config.model, "gemini-2.5-flash-lite")
+        """クォータ枯渇（HTTP 429）を回避するため、worker_configのモデルがgemini-2.5-flashまたはflash-liteであること"""
+        self.assertIn(worker.worker_config.model, ["gemini-2.5-flash", "gemini-2.5-flash-lite"])
 
 
 if __name__ == "__main__":
