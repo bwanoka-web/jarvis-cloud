@@ -151,6 +151,27 @@ async def start_research_background(query: str, username: str = "admin") -> str:
 class ChatRequest(BaseModel):
     message: str = Field(..., max_length=100000, description="リサーチ指示メッセージ")
 
+# 音声認識の同音・音韻誤認に対する正規化マッピング辞書
+VOICE_NORMALIZATION_MAP = {
+    r"認証ポケットパートナー": "臨床ポケットパートナー",
+    r"認証ポケット": "臨床ポケット",
+    r"輪唱ポケットパートナー": "臨床ポケットパートナー",
+    r"輪唱ポケット": "臨床ポケット",
+    r"認承ポケットパートナー": "臨床ポケットパートナー",
+    r"認承ポケット": "臨床ポケット",
+    r"臨終ポケットパートナー": "臨床ポケットパートナー",
+    r"臨終ポケット": "臨床ポケット",
+}
+
+def normalize_voice_query(text: str) -> str:
+    """音声認識結果などの音韻誤認キーワードを正当な用語に正規化する"""
+    if not text:
+        return text
+    normalized = text
+    for pattern, replacement in VOICE_NORMALIZATION_MAP.items():
+        normalized = re.sub(pattern, replacement, normalized)
+    return normalized
+
 # R2-04: Gemini APIクォータ枯渇・連打防止のためのレートリミット（受付制限）
 USER_REQUEST_LOG = defaultdict(list)
 MAX_REQUESTS_PER_MINUTE = int(os.environ.get("MAX_REQUESTS_PER_MINUTE", "60"))
@@ -172,9 +193,11 @@ async def chat_with_pm(request: ChatRequest, username: str = Depends(get_current
     client_ip = raw_request.client.host if (raw_request and raw_request.client) else "unknown"
     enforce_user_rate_limit(username, client_ip)
 
+    normalized_message = normalize_voice_query(request.message)
+
     async def generate():
         try:
-            reply_msg = await start_research_background(request.message, username=username)
+            reply_msg = await start_research_background(normalized_message, username=username)
             yield reply_msg
         except PermissionError as pe:
             logger.error("チャット受付中に権限エラーが発生しました: %s", pe, exc_info=True)
@@ -359,6 +382,27 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                 return cleaned.trim() || text.trim();
             }
 
+            // 音声認識の同音・音韻誤認辞書マッピング（走行ノイズ耐性）
+            const SPEECH_NORMALIZATION_MAP = [
+                { pattern: /認証ポケットパートナー/g, replacement: "臨床ポケットパートナー" },
+                { pattern: /認証ポケット/g, replacement: "臨床ポケット" },
+                { pattern: /輪唱ポケットパートナー/g, replacement: "臨床ポケットパートナー" },
+                { pattern: /輪唱ポケット/g, replacement: "臨床ポケット" },
+                { pattern: /認承ポケットパートナー/g, replacement: "臨床ポケットパートナー" },
+                { pattern: /認承ポケット/g, replacement: "臨床ポケット" },
+                { pattern: /臨終ポケットパートナー/g, replacement: "臨床ポケットパートナー" },
+                { pattern: /臨終ポケット/g, replacement: "臨床ポケット" }
+            ];
+
+            function normalizeSpeechText(text) {
+                if (!text) return text;
+                let normalized = text;
+                for (const item of SPEECH_NORMALIZATION_MAP) {
+                    normalized = normalized.replace(item.pattern, item.replacement);
+                }
+                return normalized;
+            }
+
             // R4-02: 車載高精度音響反響判定アルゴリズム
             function isAcousticEcho(inputTranscript, lastSpoken, ttsEndedTimestamp) {
                 if (!lastSpoken || !inputTranscript) return false;
@@ -510,6 +554,7 @@ async def get_dashboard(username: str = Depends(get_current_username)):
 
                     // 全音声入力モード（ウェイクワードがあれば自然に除去）
                     newTranscript = cleanWakeWords(newTranscript);
+                    newTranscript = normalizeSpeechText(newTranscript);
                     if (!newTranscript) return;
                     
                     transcriptBuffer += newTranscript + " ";
@@ -807,8 +852,9 @@ async def get_dashboard(username: str = Depends(get_current_username)):
 
             form.addEventListener('submit', async (e) => {
                 e.preventDefault();
-                const message = input.value.trim();
-                if (!message) return;
+                const rawMessage = input.value.trim();
+                if (!rawMessage) return;
+                const message = normalizeSpeechText(rawMessage);
 
                 // 認識タイマーのクリアとマイクの一時停止
                 try {

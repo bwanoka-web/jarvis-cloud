@@ -110,6 +110,67 @@ class TestWorkerBoostSystem(unittest.TestCase):
             di_content = f.read()
         self.assertIn("projects/", di_content)
 
+    def test_clinical_pocket_partner_identity_and_targets(self):
+        inst = worker.SYSTEM_INSTRUCTIONS
+        self.assertIn("臨床ポケットパートナー（Clinical Pocket Partner）", inst)
+        self.assertIn("一次ターゲット（主要顧客）", inst)
+        self.assertIn("医療・臨床現場の従事者", inst)
+        self.assertIn("二次ターゲット", inst)
+        self.assertIn("車内・移動中のエグゼクティブ・経営者", inst)
+
+    def test_fault_tolerant_voice_and_decoupling_boundaries(self):
+        inst = worker.SYSTEM_INSTRUCTIONS
+        self.assertIn("音声誤認識の文脈フォールトトレラント解釈", inst)
+        self.assertIn("認証ポケットパートナー", inst)
+        self.assertIn("輪唱", inst)
+        self.assertIn("社内プロジェクト資産（BUYMA等）のこじつけ防止境界", inst)
+        self.assertIn("無理にBUYMAや物販システムに結びつけて回答", inst)
+
+    def test_concise_mode_flexibility(self):
+        inst = worker.SYSTEM_INSTRUCTIONS
+        self.assertIn("柔軟性の付与", inst)
+        self.assertIn("短めで", inst)
+        self.assertIn("80〜120文字", inst)
+
+    def test_clinical_pocket_partner_document_exists(self):
+        doc_path = os.path.join(BASE_DIR, "CLINICAL_POCKET_PARTNER.md")
+        self.assertTrue(os.path.exists(doc_path))
+        with open(doc_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn("臨床ポケットパートナー (Clinical Pocket Partner) 基盤定義書", content)
+        self.assertIn("一次ターゲット（主要顧客）", content)
+        self.assertIn("二次ターゲット", content)
+        self.assertIn("フォールトトレランス仕様", content)
+
+    def test_main_voice_normalization_logic(self):
+        import main
+        self.assertEqual(
+            main.normalize_voice_query("認証ポケットパートナーのターゲットは？"),
+            "臨床ポケットパートナーのターゲットは？"
+        )
+        self.assertEqual(
+            main.normalize_voice_query("認証ポケットの機能について"),
+            "臨床ポケットの機能について"
+        )
+        self.assertEqual(
+            main.normalize_voice_query("輪唱ポケットパートナーの最新状況"),
+            "臨床ポケットパートナーの最新状況"
+        )
+        self.assertEqual(
+            main.normalize_voice_query("認承ポケットを教えて"),
+            "臨床ポケットを教えて"
+        )
+        self.assertEqual(
+            main.normalize_voice_query("臨終ポケットパートナーについて"),
+            "臨床ポケットパートナーについて"
+        )
+        # 影響のない文変数は維持される
+        self.assertEqual(
+            main.normalize_voice_query("BUYMAの在庫監視状況"),
+            "BUYMAの在庫監視状況"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
+
