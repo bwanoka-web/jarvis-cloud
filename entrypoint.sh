@@ -26,6 +26,11 @@ if [ ! -w /app/workspace/reports ]; then
     exit 1
 fi
 
+if [ ! -w /app/workspace/memory ]; then
+    echo "[entrypoint] ERROR: /app/workspace/memory is not writable by $(whoami)" >&2
+    exit 1
+fi
+
 # 4. supervisord設定ファイルの存在確認
 SUPERVISOR_CONF="/etc/supervisor/conf.d/supervisord.conf"
 if [ ! -f "${SUPERVISOR_CONF}" ]; then

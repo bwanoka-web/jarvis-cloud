@@ -267,6 +267,76 @@ class TestPresidentTwinSystem(unittest.TestCase):
         self.assertIn("DELIVERABLES VIEWER", html)
         self.assertIn("J.A.R.V.I.S.", html)
 
+    def test_18_memory_manager_deepcopy_safety(self):
+        """load_memory が DEFAULT_MEMORY のディープコピーを返し、破壊的変更から防御すること"""
+        mem = memory_manager.load_memory()
+        mem["core_rules"].append("MALICIOUS_MUTATION")
+        mem["preferences"]["communication_style"] = "MUTATED"
+        self.assertNotIn("MALICIOUS_MUTATION", memory_manager.DEFAULT_MEMORY["core_rules"])
+        self.assertNotEqual("MUTATED", memory_manager.DEFAULT_MEMORY["preferences"]["communication_style"])
+
+    def test_19_memory_manager_short_and_extended_patterns(self):
+        """短い重要単語（品質、ROI）や拡張構文（話して、進めて）から記憶が抽出されること"""
+        cases = [
+            ("今後は結論先行で話して", "行動・指示ルール"),
+            ("ROIを最優先に", "優先順位"),
+            ("品質を重視して", "優先順位"),
+            ("これからはスピード重視で行こう", "行動・指示ルール"),
+        ]
+        for query, expected_cat in cases:
+            res = memory_manager.extract_and_update_memory(query)
+            self.assertTrue(len(res) > 0, f"抽出失敗: {query}")
+            self.assertTrue(any(expected_cat in r for r in res))
+
+    def test_20_memory_manager_null_safe_context(self):
+        """記憶データに None や破損キーが含まれていても例外なくフォーマット可能であること"""
+        corrupted_mem = {
+            "version": "1.0",
+            "core_rules": None,
+            "preferences": None,
+            "custom_memories": None
+        }
+        with patch.object(memory_manager, "load_memory", return_value=corrupted_mem):
+            ctx = memory_manager.get_formatted_memory_context()
+            self.assertIn("社長の思考ルール・嗜好・蓄積記憶", ctx)
+
+    def test_21_stream_gemini_talk_fallback(self):
+        """一次モデルが失敗した場合にフォールバックモデルが実行されること"""
+        async def run_talk():
+            chunks = []
+            with patch("os.environ.get", return_value="fake_api_key"):
+                # google.genai.Client をモック
+                mock_client = AsyncMock()
+                attempt_count = 0
+
+                async def mock_generate_stream(model, contents, config):
+                    nonlocal attempt_count
+                    attempt_count += 1
+                    if model == "gemini-2.5-flash":
+                        raise RuntimeError("Quota exceeded on primary")
+                    
+                    async def async_chunks():
+                        yield type("Chunk", (), {"text": f"フォールバック成功({model})"})()
+                    return async_chunks()
+
+                mock_client.aio.models.generate_content_stream = mock_generate_stream
+                with patch("google.genai.Client", return_value=mock_client):
+                    async for chunk in main.stream_gemini_talk("テスト壁打ち"):
+                        chunks.append(chunk)
+            return "".join(chunks)
+
+        result = asyncio.run(run_talk())
+        self.assertIn("フォールバック成功", result)
+
+    def test_22_dashboard_japanese_status_labels(self):
+        """Drive Mode UIに運転中視認性の高い日本語ボタン・ステータス表記が含まれること"""
+        res = self.client.get("/", auth=("admin", "password123"))
+        self.assertEqual(res.status_code, 200)
+        html = res.text
+        self.assertIn("壁打ち対話モード", html)
+        self.assertIn("業務タスクモード", html)
+        self.assertIn("待機中", html)
+
 
 if __name__ == "__main__":
     unittest.main()

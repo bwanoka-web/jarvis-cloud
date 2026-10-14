@@ -217,18 +217,32 @@ async def stream_gemini_talk(prompt: str):
             max_output_tokens=350,
             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
         )
-        response_stream = await client.aio.models.generate_content_stream(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=config
-        )
-        full_text = ""
-        async for chunk in response_stream:
-            if chunk.text:
-                full_text += chunk.text
-                yield chunk.text
+        
+        models_to_try = ["gemini-2.5-flash", "gemini-flash-latest", "gemini-flash-lite-latest"]
+        success = False
+        for model_name in models_to_try:
+            try:
+                response_stream = await client.aio.models.generate_content_stream(
+                    model=model_name,
+                    contents=prompt,
+                    config=config
+                )
+                yielded_any = False
+                async for chunk in response_stream:
+                    if chunk.text:
+                        # 指示通り**強調記号を除去しクリーンな口頭日本語を出力
+                        clean_text = chunk.text.replace("**", "")
+                        if clean_text:
+                            yielded_any = True
+                            yield clean_text
+                if yielded_any:
+                    success = True
+                    break
+            except Exception as stream_err:
+                logger.warning("モデル %s ストリーミング試行エラー: %s", model_name, stream_err)
+                continue
 
-        if not full_text.strip():
+        if not success:
             yield "社長、アイデアを承りました。迅速に検証を進めましょう。"
     except Exception as e:
         logger.error("Gemini壁打ちストリーミングエラー: %s", e)
@@ -422,11 +436,11 @@ async def get_dashboard(username: str = Depends(get_current_username)):
             <div class="flex items-center gap-3">
                 <h1 class="text-xl font-black tracking-widest text-sky-300">J.A.R.V.I.S.</h1>
                 <div class="flex items-center bg-gray-950 border border-sky-800 rounded-lg p-1 gap-1">
-                    <button type="button" id="mode-talk-btn" class="px-3 py-1.5 text-xs font-bold rounded transition bg-cyan-600 text-white shadow">⚡ 壁打ち対話 (TALK)</button>
-                    <button type="button" id="mode-task-btn" class="px-3 py-1.5 text-xs font-bold rounded transition text-gray-400 hover:text-white">💼 業務タスク (TASK)</button>
+                    <button type="button" id="mode-talk-btn" class="px-3 md:px-4 py-1.5 md:py-2 text-xs md:text-sm font-bold rounded transition bg-cyan-600 text-white shadow">⚡ 壁打ち対話モード</button>
+                    <button type="button" id="mode-task-btn" class="px-3 md:px-4 py-1.5 md:py-2 text-xs md:text-sm font-bold rounded transition text-gray-400 hover:text-white">💼 業務タスクモード</button>
                 </div>
             </div>
-            <span class="text-xs px-2.5 py-1 rounded border border-sky-700 bg-sky-950/80 text-sky-300 font-bold tracking-wider" id="system-status">STATUS: STANDBY</span>
+            <span class="text-xs px-2.5 py-1 rounded border border-sky-700 bg-sky-950/80 text-sky-300 font-bold tracking-wider" id="system-status">🟢 待機中 (STANDBY)</span>
         </header>
         
         <main class="flex-1 overflow-y-auto md:overflow-hidden p-3 md:p-4 flex flex-col md:flex-row gap-3 md:gap-4" id="main-container">
@@ -503,20 +517,40 @@ async def get_dashboard(username: str = Depends(get_current_username)):
             let speechTimeout = null;
             let activeMode = "talk";
 
+            function updateSystemStatus(state) {
+                if (!systemStatus) return;
+                if (state === 'LISTENING') {
+                    systemStatus.innerText = '🎙️ 聞き取り中 (LISTENING)';
+                    systemStatus.className = 'text-xs px-2.5 py-1 rounded border border-emerald-500 bg-emerald-950/80 text-emerald-300 font-bold tracking-wider animate-pulse';
+                } else if (state === 'THINKING') {
+                    systemStatus.innerText = '⏳ 思考中 (THINKING)';
+                    systemStatus.className = 'text-xs px-2.5 py-1 rounded border border-amber-500 bg-amber-950/80 text-amber-300 font-bold tracking-wider animate-pulse';
+                } else if (state === 'SPEAKING') {
+                    systemStatus.innerText = '🔊 発話中 (SPEAKING)';
+                    systemStatus.className = 'text-xs px-2.5 py-1 rounded border border-purple-500 bg-purple-950/80 text-purple-300 font-bold tracking-wider animate-pulse';
+                } else if (state === 'ERROR') {
+                    systemStatus.innerText = '⚠️ エラー (ERROR)';
+                    systemStatus.className = 'text-xs px-2.5 py-1 rounded border border-red-500 bg-red-950/80 text-red-300 font-bold tracking-wider';
+                } else {
+                    systemStatus.innerText = '🟢 待機中 (STANDBY)';
+                    systemStatus.className = 'text-xs px-2.5 py-1 rounded border border-sky-700 bg-sky-950/80 text-sky-300 font-bold tracking-wider';
+                }
+            }
+
             function setMode(newMode) {
                 activeMode = newMode;
                 if (newMode === 'talk') {
-                    modeTalkBtn.className = "px-3 py-1.5 text-xs font-bold rounded transition bg-cyan-600 text-white shadow";
-                    modeTaskBtn.className = "px-3 py-1.5 text-xs font-bold rounded transition text-gray-400 hover:text-white";
+                    modeTalkBtn.className = "px-3 md:px-4 py-1.5 md:py-2 text-xs md:text-sm font-bold rounded transition bg-cyan-600 text-white shadow";
+                    modeTaskBtn.className = "px-3 md:px-4 py-1.5 md:py-2 text-xs md:text-sm font-bold rounded transition text-gray-400 hover:text-white";
                     modeIndicator.className = "text-xs text-cyan-400 font-bold";
-                    modeIndicator.innerText = "モード: 壁打ち対話 (TALK)";
-                    showToastNotification("モード: ⚡ 壁打ち対話（1〜2秒即時テンポ回答）", 2000);
+                    modeIndicator.innerText = "モード: ⚡ 壁打ち対話モード";
+                    showToastNotification("モード: ⚡ 壁打ち対話モード（1〜2秒即時テンポ回答）", 2000);
                 } else {
-                    modeTaskBtn.className = "px-3 py-1.5 text-xs font-bold rounded transition bg-emerald-600 text-white shadow";
-                    modeTalkBtn.className = "px-3 py-1.5 text-xs font-bold rounded transition text-gray-400 hover:text-white";
+                    modeTaskBtn.className = "px-3 md:px-4 py-1.5 md:py-2 text-xs md:text-sm font-bold rounded transition bg-emerald-600 text-white shadow";
+                    modeTalkBtn.className = "px-3 md:px-4 py-1.5 md:py-2 text-xs md:text-sm font-bold rounded transition text-gray-400 hover:text-white";
                     modeIndicator.className = "text-xs text-emerald-400 font-bold";
-                    modeIndicator.innerText = "モード: 業務タスク (TASK)";
-                    showToastNotification("モード: 💼 業務タスク（自律調査・レポート生成）", 2000);
+                    modeIndicator.innerText = "モード: 💼 業務タスクモード";
+                    showToastNotification("モード: 💼 業務タスクモード（自律調査・レポート生成）", 2000);
                 }
             }
 
@@ -633,7 +667,7 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                     micBtn.classList.add('jarvis-btn-active');
                     micBtn.innerText = '🎙️ お話しください...（全音声に反応）';
                     statusText.innerText = '周囲の音声を監視中...';
-                    systemStatus.innerText = 'STATUS: LISTENING';
+                    updateSystemStatus('LISTENING');
                 } catch (e) {
                     isStarting = false;
                     if (e.name === 'InvalidStateError') {
@@ -642,7 +676,7 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                         micBtn.classList.add('jarvis-btn-active');
                         micBtn.innerText = '🎙️ お話しください...（全音声に反応）';
                         statusText.innerText = '周囲の音声を監視中...';
-                        systemStatus.innerText = 'STATUS: LISTENING';
+                        updateSystemStatus('LISTENING');
                     } else if (e.name !== 'NotAllowedError') {
                         setTimeout(() => {
                             if (isContinuousMode && !isAiSpeaking && !isAiThinking && !isRecognizing && !isStarting) {
@@ -668,7 +702,7 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                     micBtn.classList.add('jarvis-btn-active');
                     micBtn.innerText = '🎙️ お話しください...（全音声に反応）';
                     statusText.innerText = '周囲の音声を監視中...';
-                    systemStatus.innerText = 'STATUS: LISTENING';
+                    updateSystemStatus('LISTENING');
                 };
                 
                 recognition.onresult = (event) => {
@@ -734,7 +768,7 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                             micBtn.classList.remove('jarvis-btn-active', 'jarvis-btn-thinking', 'jarvis-btn-speaking');
                             micBtn.classList.add('jarvis-btn');
                             micBtn.innerText = '🎙️ マイク許可後にタップしてください';
-                            systemStatus.innerText = 'STATUS: STANDBY';
+                            updateSystemStatus('STANDBY');
                             break;
                         case 'network':
                             statusText.innerText = '⚠️ 音声認識ネットワーク待機中...自動復帰を試みます';
@@ -805,20 +839,24 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                     micBtn.classList.add('jarvis-btn-active');
                     micBtn.innerText = '🎙️ お話しください...（全音声に反応）';
                     statusText.innerText = '周囲の音声を監視中...';
-                    systemStatus.innerText = 'STATUS: LISTENING';
+                    updateSystemStatus('LISTENING');
                     try { unlockAudio(); } catch(e) { console.warn(e); }
                     restartRecognitionIfNeeded();
                 } else {
                     if (recognition) {
                         try { recognition.stop(); } catch(e){}
                     }
+                    if (window.speechSynthesis) {
+                        try { window.speechSynthesis.cancel(); } catch(e){}
+                    }
+                    isAiSpeaking = false;
                     isRecognizing = false;
                     isStarting = false;
                     micBtn.classList.remove('jarvis-btn-active', 'jarvis-btn-thinking', 'jarvis-btn-speaking');
                     micBtn.classList.add('jarvis-btn');
                     micBtn.innerText = '🎙️ 常時リスニング開始';
                     statusText.innerText = 'マイクはオフです';
-                    systemStatus.innerText = 'STATUS: STANDBY';
+                    updateSystemStatus('STANDBY');
                 }
             });
 
@@ -860,7 +898,7 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                 micBtn.classList.remove('jarvis-btn-active', 'jarvis-btn-thinking');
                 micBtn.classList.add('jarvis-btn-speaking');
                 micBtn.innerText = '🔊 社長分身AI 発話中...';
-                systemStatus.innerText = 'STATUS: SPEAKING';
+                updateSystemStatus('SPEAKING');
                 statusText.innerText = isShortReply ? '壁打ち音声を再生中（マイク一時停止）' : '報告書を音声解説中（マイク一時停止）';
 
                 ttsQueue = splitIntoSentences(fullText);
@@ -968,7 +1006,7 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                         micBtn.classList.add('jarvis-btn');
                         micBtn.innerText = '🎙️ 常時リスニング開始';
                         statusText.innerText = 'マイクはオフです';
-                        systemStatus.innerText = 'STATUS: STANDBY';
+                        updateSystemStatus('STANDBY');
                     }
                 }, 1000);
             }
@@ -1054,7 +1092,7 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                     micBtn.innerText = '⏳ 思考中...';
                 }
 
-                systemStatus.innerText = 'STATUS: THINKING';
+                updateSystemStatus('THINKING');
                 statusText.innerText = activeMode === 'talk' ? '壁打ち思考中（1〜2秒で即答）...' : 'タスク指示を送信中...';
 
                 const agentBubble = appendMessage('社長分身AI', '...', 'jarvis-panel self-start w-5/6');
@@ -1077,24 +1115,27 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                     }
                     
                     isAiThinking = false;
-                    systemStatus.innerText = 'STATUS: ONLINE';
                     
                     if (activeMode === 'talk') {
                         statusText.innerText = '回答を音声出力中...';
                         if (fullResponse.trim()) {
                             speakText(fullResponse.trim(), true);
+                        } else {
+                            updateSystemStatus(isContinuousMode ? 'LISTENING' : 'STANDBY');
                         }
                     } else {
                         statusText.innerText = 'リクエストを受け付けました。調査完了まで待機中...';
                         if (fullResponse.trim()) {
                             speakText(fullResponse.trim(), true);
+                        } else {
+                            updateSystemStatus(isContinuousMode ? 'LISTENING' : 'STANDBY');
                         }
                     }
 
                 } catch (error) {
                     isAiThinking = false;
                     contentDiv.innerText += '\\n[通信エラーが発生しました]';
-                    systemStatus.innerText = 'STATUS: ERROR';
+                    updateSystemStatus('ERROR');
                     statusText.innerText = '通信エラーが発生しました';
                     if (isContinuousMode) {
                         restartRecognitionIfNeeded();

@@ -6,6 +6,7 @@ workspace/memory/president_memory.json に対し、
 対話や指示から自動抽出・更新・参照するロジックを提供します。
 """
 
+import copy
 from datetime import datetime, timezone
 import json
 import logging
@@ -50,11 +51,11 @@ def get_memory_file_path() -> str:
 def load_memory() -> dict:
     """
     記憶ファイル（president_memory.json）を安全に読み込みます。
-    ファイルが存在しないか破損している場合はデフォルト記憶を返します。
+    ファイルが存在しないか破損している場合はデフォルト記憶のディープコピーを返します。
     """
     ensure_memory_dir()
     if not os.path.exists(MEMORY_FILE):
-        init_mem = dict(DEFAULT_MEMORY)
+        init_mem = copy.deepcopy(DEFAULT_MEMORY)
         init_mem["updated_at"] = datetime.now(timezone.utc).isoformat()
         save_memory(init_mem)
         return init_mem
@@ -65,10 +66,10 @@ def load_memory() -> dict:
             if isinstance(data, dict):
                 return data
             logger.warning("記憶ファイルのルート要素が辞書ではありません。デフォルトを使用します。")
-            return dict(DEFAULT_MEMORY)
+            return copy.deepcopy(DEFAULT_MEMORY)
     except Exception as e:
         logger.error("記憶ファイル読み込みエラー: %s", e)
-        return dict(DEFAULT_MEMORY)
+        return copy.deepcopy(DEFAULT_MEMORY)
 
 def save_memory(memory_data: dict) -> bool:
     """
@@ -129,21 +130,21 @@ def get_formatted_memory_context() -> str:
     data = load_memory()
     lines = ["【社長の思考ルール・嗜好・蓄積記憶】"]
     
-    rules = data.get("core_rules", [])
+    rules = data.get("core_rules") or []
     if rules:
         lines.append("・基本思考ルール:")
         for r in rules:
             lines.append(f"  - {r}")
             
-    prefs = data.get("preferences", {})
+    prefs = data.get("preferences") or {}
     if prefs:
         lines.append(f"・対話スタイル: {prefs.get('communication_style', '')}")
         lines.append(f"・判断基準: {prefs.get('decision_criteria', '')}")
-        focus = prefs.get("focus_areas", [])
+        focus = prefs.get("focus_areas") or []
         if focus:
             lines.append(f"・注力テーマ: {', '.join(focus)}")
             
-    customs = data.get("custom_memories", [])
+    customs = data.get("custom_memories") or []
     if customs:
         lines.append("・対話から抽出された社長の指示・価値観:")
         for c in customs[-10:]:  # 直近10件
@@ -153,10 +154,10 @@ def get_formatted_memory_context() -> str:
 
 # 社長の嗜好や方針表明を検知する正規表現パターン
 MEMORY_EXTRACTION_PATTERNS = [
-    (r"(?:今後は|これからは|次からは|常に|必ず)(.+?)(?:にして|として|でいこう|で頼む|でいく)", "行動・指示ルール"),
+    (r"(?:今後は|これからは|次からは|常に|必ず)(.+?)(?:にして|として|でいこう|で頼む|でいく|でお願い|で頼みます|にしてください|にしてほしい|としてほしい|としてください|を徹底|を意識|で進めて|でやって|で行こう|で話して)", "行動・指示ルール"),
     (r"(?:私の考えは|私の方針は|方針として|俺の考えは|僕の考えは)(.+?)(?:だ|です|とする|と考えている)", "経営・判断方針"),
-    (r"(?:覚えておいて|記憶して|メモしておいて)(?:ほしい)?[:：]?\s*(.+)", "個別記憶"),
-    (r"(.+?)(?:を優先して|を最優先に|を重視して)", "優先順位"),
+    (r"(?:覚えておいて|記憶して|メモしておいて)(?:ほしい|ください)?[:：]?\s*(.+)", "個別記憶"),
+    (r"(.+?)(?:を優先して|を最優先に|を最優先で|を重視して|最優先)", "優先順位"),
 ]
 
 def extract_and_update_memory(text: str) -> list[str]:
@@ -174,8 +175,8 @@ def extract_and_update_memory(text: str) -> list[str]:
         matches = re.finditer(pattern, clean_text)
         for m in matches:
             content = m.group(1).strip()
-            # 短すぎるか長すぎるものは除外
-            if 4 <= len(content) <= 150:
+            # 2文字以上（品質、速度、ROI等を含む）150文字以内の項目を抽出
+            if 2 <= len(content) <= 150:
                 if add_memory_item(category, content):
                     extracted_items.append(f"{category}: {content}")
                     
