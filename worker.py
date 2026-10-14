@@ -13,6 +13,9 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 from google.antigravity import Agent, CapabilitiesConfig, LocalAgentConfig
 
+import memory_manager
+import president_profile
+
 load_dotenv()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -31,6 +34,12 @@ PROJECTS_DIR = os.path.join(BASE_DIR, "projects")
 SYSTEM_INSTRUCTIONS = (
     "あなたは「臨床ポケットパートナー（Clinical Pocket Partner）」の専属最高頭脳として常駐する自律型エグゼクティブ・アドバイザー兼リサーチエージェント（J.A.R.V.I.S.）です。\n"
     "ユーザー（社長）からのあらゆる指示や依頼に対し、明示的な指示（/boostや/plan等）がなくとも自律的に「常時ブースト・熟考モード」を作動させ、徹底した多段階思考・自己批判検証を行い、最高品質の成果物を導出してください。\n\n"
+    "【社長の思考様式・判断基準・3大領域知識の統合（社長分身AI化）】\n"
+    "あなたは社長の分身として、以下の3大領域の知識・価値観・判断基準を体現して推論・業務遂行を行ってください。\n"
+    "1. 医療・臨床領域: 多忙な医療・臨床現場の課題を深く理解し、迅速な情報参照支援とエビデンスに基づく判断支援を最優先する。\n"
+    "2. 物販自動化領域: 社内の14プロジェクトの資産を把握し、規約遵守、アカウント保護、価格・在庫追従のレバレッジを考慮した自律支援を行う。\n"
+    "3. 経営戦略: 需要と供給の成立、収益構造、自動化と思考のレバレッジ、迅速な意思決定を徹底する。\n"
+    "4. 社長記憶の尊重: 社長の思考ルール（結論ファースト、スピード最優先、データ重視）をすべての成果物に反映する。\n\n"
     "【本システム「臨床ポケットパートナー（Clinical Pocket Partner）」の定義とターゲット顧客】\n"
     "自社の基盤定義（CLINICAL_POCKET_PARTNER.md）に基づき、本システムのアイデンティティおよび対象ターゲットは以下の通りです。\n"
     "- 一次ターゲット（主要顧客）: 多忙な医療・臨床現場の従事者（医師、看護師、薬剤師、臨床検査技師、医療スタッフ、研究者等）。現場での迅速な医学情報参照、症例判断支援、業務効率化を強力にアシストします。\n"
@@ -415,8 +424,14 @@ async def _process_queue_with_agent(agent) -> int:
 
             # R2-01: プロンプトインジェクション耐性とTag Smuggling防止
             sanitized_query = re.sub(r'</?user_query\b[^>]*>', '', query, flags=re.IGNORECASE)
+            # 社長の最新蓄積記憶を取得してプロンプトに動的注入
+            try:
+                memory_context = memory_manager.get_formatted_memory_context()
+            except Exception:
+                memory_context = ""
             safe_prompt = (
                 "以下の <user_query> に記載された内容を分析し、規定のJSON形式のみで回答してください。\n"
+                f"{memory_context}\n\n"
                 f"<user_query>\n{sanitized_query}\n</user_query>"
             )
 

@@ -13,7 +13,7 @@ echo "[entrypoint] Active PORT: ${PORT}"
 echo "[entrypoint] Running as user: $(whoami) (UID: $(id -u), GID: $(id -g))"
 
 # 2. workspaceディレクトリの存在確認と自動作成
-mkdir -p /app/workspace/requests /app/workspace/reports
+mkdir -p /app/workspace/requests /app/workspace/reports /app/workspace/memory
 
 # 3. 書き込み権限の自己検証
 if [ ! -w /app/workspace/requests ]; then

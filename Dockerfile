@@ -44,11 +44,12 @@ COPY --chown=appuser:appuser . .
 # /tmp: 一時ファイルおよびsupervisordのpid/sock出力先
 RUN mkdir -p /app/workspace/requests \
              /app/workspace/reports \
+             /app/workspace/memory \
              /var/log/supervisor \
              /tmp && \
     chown -R appuser:appuser /app /var/log/supervisor /tmp && \
     chmod 555 /app/*.py && \
-    chmod 750 /app/workspace/requests /app/workspace/reports
+    chmod 750 /app/workspace/requests /app/workspace/reports /app/workspace/memory
 
 # 8. entrypoint.sh のパーミッション設定およびWindows CRLF改行コードのLF変換
 RUN chmod +x /app/entrypoint.sh && \

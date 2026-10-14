@@ -11,6 +11,8 @@ import uuid
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException, Request, status
+import memory_manager
+import president_profile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -148,8 +150,13 @@ async def start_research_background(query: str, username: str = "admin") -> str:
     os.replace(temp_path, target_path)
     return "リクエストを受け付け、バックグラウンド調査キューに登録しました。"
 
+class ConverseRequest(BaseModel):
+    message: str = Field(..., max_length=100000, description="対話または指示メッセージ")
+    mode: str = Field(default="auto", description="対話モード: auto, talk, task")
+
 class ChatRequest(BaseModel):
     message: str = Field(..., max_length=100000, description="リサーチ指示メッセージ")
+    mode: str = Field(default="task", description="処理モード")
 
 # 音声認識の同音・音韻誤認に対する正規化マッピング辞書
 VOICE_NORMALIZATION_MAP = {
@@ -158,6 +165,10 @@ VOICE_NORMALIZATION_MAP = {
     r"(?:認証|認承|輪唱|臨終|人称|にんしょう|ニンショウ)\s*パートナー": "臨床ポケットパートナー",
     r"臨床\s*ポケット\s*パートナー": "臨床ポケットパートナー",
     r"臨床\s*ポケット": "臨床ポケット",
+    r"バイマ": "BUYMA",
+    r"ばいま": "BUYMA",
+    r"エッセンス": "SSENSE",
+    r"ユークス": "YOOX",
 }
 
 def normalize_voice_query(text: str) -> str:
@@ -168,6 +179,60 @@ def normalize_voice_query(text: str) -> str:
     for pattern, replacement in VOICE_NORMALIZATION_MAP.items():
         normalized = re.sub(pattern, replacement, normalized)
     return normalized
+
+# タスクモード自動判定キーワード群
+TASK_KEYWORDS = [
+    "調べて", "リサーチして", "調査して", "まとめておいて", "まとめを作成", "レポートを作って",
+    "コードを修正して", "修正して", "監視して", "スクレイピングして", "裏でやって", "タスクにして",
+    "分析してまとめて", "バックグラウンドで", "タスク実行", "報告書を作成", "調査レポート"
+]
+
+def classify_mode(text: str, explicit_mode: str = "auto") -> str:
+    if explicit_mode in ("talk", "task"):
+        return explicit_mode
+    clean = text.lower()
+    for kw in TASK_KEYWORDS:
+        if kw in clean:
+            return "task"
+    return "talk"
+
+async def stream_gemini_talk(prompt: str):
+    """社長プロファイルと記憶を組み込んだGemini 2.5 Flashによる1〜2秒の即時ストリーミング壁打ち"""
+    system_instructions = (
+        president_profile.get_president_system_instructions(mode="talk") + "\n\n" +
+        memory_manager.get_formatted_memory_context()
+    )
+    gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not gemini_key:
+        yield "社長、APIキーが未設定のためデモ応答いたします。どのような壁打ちでもお任せください。"
+        return
+
+    try:
+        from google import genai
+        from google.genai import types
+        client = genai.Client(api_key=gemini_key)
+        config = types.GenerateContentConfig(
+            system_instruction=system_instructions,
+            temperature=0.7,
+            max_output_tokens=350,
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        )
+        response_stream = await client.aio.models.generate_content_stream(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=config
+        )
+        full_text = ""
+        async for chunk in response_stream:
+            if chunk.text:
+                full_text += chunk.text
+                yield chunk.text
+
+        if not full_text.strip():
+            yield "社長、アイデアを承りました。迅速に検証を進めましょう。"
+    except Exception as e:
+        logger.error("Gemini壁打ちストリーミングエラー: %s", e)
+        yield "社長、通信状況により即答が遅れました。再度お話しいただくか、裏で調査を進めます。"
 
 # R2-04: Gemini APIクォータ枯渇・連打防止のためのレートリミット（受付制限）
 USER_REQUEST_LOG = defaultdict(list)
@@ -185,12 +250,56 @@ def enforce_user_rate_limit(user: str, client_ip: str = None):
         )
     USER_REQUEST_LOG[user].append(now)
 
-@app.post("/api/chat")
-async def chat_with_pm(request: ChatRequest, username: str = Depends(get_current_username), raw_request: Request = None):
+@app.post("/api/converse")
+async def converse_with_president_ai(
+    request: ConverseRequest,
+    username: str = Depends(get_current_username),
+    raw_request: Request = None
+):
     client_ip = raw_request.client.host if (raw_request and raw_request.client) else "unknown"
     enforce_user_rate_limit(username, client_ip)
 
     normalized_message = normalize_voice_query(request.message)
+
+    try:
+        memory_manager.extract_and_update_memory(normalized_message)
+    except Exception as me:
+        logger.warning("記憶抽出中にエラー: %s", me)
+
+    selected_mode = classify_mode(normalized_message, request.mode)
+
+    async def generate_response():
+        try:
+            if selected_mode == "task":
+                reply_msg = await start_research_background(normalized_message, username=username)
+                yield "承知いたしました。裏で調査・作業を進めます。完了次第、最新レポートでお知らせします。"
+            else:
+                async for chunk in stream_gemini_talk(normalized_message):
+                    yield chunk
+        except PermissionError as pe:
+            logger.error("対話処理中に権限エラー: %s", pe, exc_info=True)
+            yield f"\n[エラーが発生しました]: {str(pe)}"
+        except Exception as e:
+            logger.error("対話処理中に予期せぬ内部エラー: %s", e, exc_info=True)
+            yield "\n[エラーが発生しました]: サーバー内部で処理エラーが発生しました。時間をおいて再試行してください。"
+
+    return StreamingResponse(generate_response(), media_type="text/plain")
+
+@app.post("/api/chat")
+async def chat_with_pm(
+    request: ChatRequest,
+    username: str = Depends(get_current_username),
+    raw_request: Request = None
+):
+    client_ip = raw_request.client.host if (raw_request and raw_request.client) else "unknown"
+    enforce_user_rate_limit(username, client_ip)
+
+    normalized_message = normalize_voice_query(request.message)
+
+    try:
+        memory_manager.extract_and_update_memory(normalized_message)
+    except Exception:
+        pass
 
     async def generate():
         try:
@@ -204,6 +313,10 @@ async def chat_with_pm(request: ChatRequest, username: str = Depends(get_current
             yield "\n[エラーが発生しました]: サーバー内部で処理エラーが発生しました。時間をおいて再試行してください。"
 
     return StreamingResponse(generate(), media_type="text/plain")
+
+@app.get("/api/memory")
+async def get_president_memory(username: str = Depends(get_current_username)):
+    return memory_manager.load_memory()
 
 @app.get("/api/latest_report")
 async def get_latest_report(username: str = Depends(get_current_username)):
@@ -281,13 +394,16 @@ async def get_dashboard(username: str = Depends(get_current_username)):
         <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
         <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
         <style>
-            body { background-color: #050a1f; color: #4fc3f7; }
+            body { background-color: #030712; color: #38bdf8; }
             .jarvis-header { background-color: #020617; border-bottom: 1px solid #0369a1; }
-            .jarvis-panel { background-color: rgba(2, 6, 23, 0.7); border: 1px solid #0369a1; box-shadow: 0 0 10px #0369a1; }
-            .jarvis-btn { background: linear-gradient(135deg, #0284c7, #0369a1); box-shadow: 0 0 15px #0284c7; }
-            .jarvis-btn-active { background: linear-gradient(135deg, #059669, #047857); box-shadow: 0 0 20px #059669; animation: pulse-green 2s infinite; }
-            .jarvis-btn-thinking { background: linear-gradient(135deg, #d97706, #b45309); box-shadow: 0 0 20px #d97706; }
-            @keyframes pulse-green { 0% { box-shadow: 0 0 0 0 rgba(5, 150, 105, 0.7); } 70% { box-shadow: 0 0 0 15px rgba(5, 150, 105, 0); } 100% { box-shadow: 0 0 0 0 rgba(5, 150, 105, 0); } }
+            .jarvis-panel { background-color: rgba(3, 7, 18, 0.85); border: 1px solid #0369a1; box-shadow: 0 0 12px rgba(2, 132, 199, 0.25); }
+            .jarvis-btn { background: linear-gradient(135deg, #0284c7, #0369a1); box-shadow: 0 0 15px rgba(2, 132, 199, 0.5); }
+            .jarvis-btn-active { background: linear-gradient(135deg, #059669, #047857); box-shadow: 0 0 25px rgba(5, 150, 105, 0.7); animation: pulse-green 1.8s infinite; }
+            .jarvis-btn-thinking { background: linear-gradient(135deg, #d97706, #b45309); box-shadow: 0 0 25px rgba(217, 119, 6, 0.7); animation: pulse-amber 1.8s infinite; }
+            .jarvis-btn-speaking { background: linear-gradient(135deg, #7c3aed, #6d28d9); box-shadow: 0 0 25px rgba(124, 58, 237, 0.7); animation: pulse-purple 1.8s infinite; }
+            @keyframes pulse-green { 0% { box-shadow: 0 0 0 0 rgba(5, 150, 105, 0.8); } 70% { box-shadow: 0 0 0 18px rgba(5, 150, 105, 0); } 100% { box-shadow: 0 0 0 0 rgba(5, 150, 105, 0); } }
+            @keyframes pulse-amber { 0% { box-shadow: 0 0 0 0 rgba(217, 119, 6, 0.8); } 70% { box-shadow: 0 0 0 18px rgba(217, 119, 6, 0); } 100% { box-shadow: 0 0 0 0 rgba(217, 119, 6, 0); } }
+            @keyframes pulse-purple { 0% { box-shadow: 0 0 0 0 rgba(124, 58, 237, 0.8); } 70% { box-shadow: 0 0 0 18px rgba(124, 58, 237, 0); } 100% { box-shadow: 0 0 0 0 rgba(124, 58, 237, 0); } }
             .markdown-body h1, .markdown-body h2, .markdown-body h3 { color: #38bdf8; margin-top: 1em; margin-bottom: 0.5em; font-weight: bold; }
             .markdown-body h1 { font-size: 1.5em; border-bottom: 1px solid #0369a1; padding-bottom: 0.3em; }
             .markdown-body h2 { font-size: 1.25em; }
@@ -302,15 +418,26 @@ async def get_dashboard(username: str = Depends(get_current_username)):
         </style>
     </head>
     <body class="min-h-screen h-[100dvh] flex flex-col font-mono">
-        <header class="jarvis-header p-4 flex justify-between items-center">
-            <h1 class="text-xl font-bold tracking-widest">J.A.R.V.I.S.</h1>
-            <span class="text-xs" id="system-status">STATUS: STANDBY</span>
+        <header class="jarvis-header p-3 md:p-4 flex flex-wrap justify-between items-center gap-2">
+            <div class="flex items-center gap-3">
+                <h1 class="text-xl font-black tracking-widest text-sky-300">J.A.R.V.I.S.</h1>
+                <div class="flex items-center bg-gray-950 border border-sky-800 rounded-lg p-1 gap-1">
+                    <button type="button" id="mode-talk-btn" class="px-3 py-1.5 text-xs font-bold rounded transition bg-cyan-600 text-white shadow">⚡ 壁打ち対話 (TALK)</button>
+                    <button type="button" id="mode-task-btn" class="px-3 py-1.5 text-xs font-bold rounded transition text-gray-400 hover:text-white">💼 業務タスク (TASK)</button>
+                </div>
+            </div>
+            <span class="text-xs px-2.5 py-1 rounded border border-sky-700 bg-sky-950/80 text-sky-300 font-bold tracking-wider" id="system-status">STATUS: STANDBY</span>
         </header>
         
         <main class="flex-1 overflow-y-auto md:overflow-hidden p-3 md:p-4 flex flex-col md:flex-row gap-3 md:gap-4" id="main-container">
             <div class="flex-1 min-h-[260px] md:min-h-0 overflow-y-auto flex flex-col gap-3 md:gap-4" id="chat-container">
                 <div class="jarvis-panel p-4 rounded-lg w-5/6">
-                    <p>システム起動。運転モード（ウェイクワード待機）を開始するには、下の「🎙️ 常時リスニング開始」ボタンを一度だけタップしてください。</p>
+                    <p class="text-sky-200 text-sm leading-relaxed font-sans">社長分身AI（臨床ポケットパートナー）待機完了。車内でのハンズフリー対話に最適化されています。</p>
+                    <p class="text-xs text-sky-400 mt-2 font-sans">
+                        ・壁打ち対話: 思考やアイデアの相談。1〜2秒で1〜2文のテンポ良い音声回答。<br>
+                        ・業務タスク: 「〜を調べて」「〜を修正して」等の自律調査と詳細レポート生成。<br>
+                        常時リスニング開始ボタンをタップして発話してください。
+                    </p>
                 </div>
             </div>
             <div class="flex-1 min-h-[300px] md:min-h-0 overflow-y-auto jarvis-panel p-3 md:p-4 rounded-lg flex flex-col gap-2">
@@ -331,15 +458,18 @@ async def get_dashboard(username: str = Depends(get_current_username)):
             <form id="chat-form" class="flex flex-col gap-3">
                 <button type="button" id="continuous-mic-btn" class="jarvis-btn text-white w-full py-4 rounded-lg font-bold tracking-wider text-lg transition">🎙️ 常時リスニング開始</button>
                 <div class="flex gap-2">
-                    <input type="text" id="message-input" class="flex-1 bg-gray-900 border border-sky-700 rounded-lg px-4 py-2 text-sky-200 focus:outline-none focus:ring-2 focus:ring-sky-400" placeholder="テキストで直接入力も可能...">
+                    <input type="text" id="message-input" class="flex-1 bg-gray-900 border border-sky-700 rounded-lg px-4 py-2 text-sky-200 focus:outline-none focus:ring-2 focus:ring-sky-400 font-sans" placeholder="テキストで直接入力も可能...">
                     <button type="submit" id="send-button" class="jarvis-btn text-white px-4 py-2 rounded-lg font-bold">SEND</button>
                 </div>
                 <div class="flex justify-between items-center px-2">
                     <span id="status-text" class="text-xs text-sky-400">マイクはオフです</span>
-                    <label class="flex items-center gap-2 text-xs cursor-pointer">
-                        <input type="checkbox" id="tts-toggle" checked class="form-checkbox bg-gray-900 border-sky-700 text-sky-500">
-                        音声読み上げ
-                    </label>
+                    <div class="flex items-center gap-3">
+                        <span id="current-mode-indicator" class="text-xs text-cyan-400 font-bold">モード: 壁打ち対話 (TALK)</span>
+                        <label class="flex items-center gap-2 text-xs cursor-pointer text-sky-300">
+                            <input type="checkbox" id="tts-toggle" checked class="form-checkbox bg-gray-900 border-sky-700 text-sky-500">
+                            音声読み上げ
+                        </label>
+                    </div>
                 </div>
             </form>
         </footer>
@@ -353,6 +483,9 @@ async def get_dashboard(username: str = Depends(get_current_username)):
             const statusText = document.getElementById('status-text');
             const ttsToggle = document.getElementById('tts-toggle');
             const systemStatus = document.getElementById('system-status');
+            const modeTalkBtn = document.getElementById('mode-talk-btn');
+            const modeTaskBtn = document.getElementById('mode-task-btn');
+            const modeIndicator = document.getElementById('current-mode-indicator');
 
             const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
             let recognition = null;
@@ -368,6 +501,27 @@ async def get_dashboard(username: str = Depends(get_current_username)):
             let lastSpokenTime = 0;
             let transcriptBuffer = "";
             let speechTimeout = null;
+            let activeMode = "talk";
+
+            function setMode(newMode) {
+                activeMode = newMode;
+                if (newMode === 'talk') {
+                    modeTalkBtn.className = "px-3 py-1.5 text-xs font-bold rounded transition bg-cyan-600 text-white shadow";
+                    modeTaskBtn.className = "px-3 py-1.5 text-xs font-bold rounded transition text-gray-400 hover:text-white";
+                    modeIndicator.className = "text-xs text-cyan-400 font-bold";
+                    modeIndicator.innerText = "モード: 壁打ち対話 (TALK)";
+                    showToastNotification("モード: ⚡ 壁打ち対話（1〜2秒即時テンポ回答）", 2000);
+                } else {
+                    modeTaskBtn.className = "px-3 py-1.5 text-xs font-bold rounded transition bg-emerald-600 text-white shadow";
+                    modeTalkBtn.className = "px-3 py-1.5 text-xs font-bold rounded transition text-gray-400 hover:text-white";
+                    modeIndicator.className = "text-xs text-emerald-400 font-bold";
+                    modeIndicator.innerText = "モード: 業務タスク (TASK)";
+                    showToastNotification("モード: 💼 業務タスク（自律調査・レポート生成）", 2000);
+                }
+            }
+
+            if (modeTalkBtn) modeTalkBtn.addEventListener('click', () => setMode('talk'));
+            if (modeTaskBtn) modeTaskBtn.addEventListener('click', () => setMode('task'));
 
             // 車載音声コマンド（ウェイクワードの有無に関わらず全音声に自然反応）
             const WAKE_WORDS = ["ジャービス", "jarvis", "ジャビス"];
@@ -385,7 +539,10 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                 { pattern: /(?:認証|認承|輪唱|臨終|人称|にんしょう|ニンショウ)\\s*ポケット/g, replacement: "臨床ポケット" },
                 { pattern: /(?:認証|認承|輪唱|臨終|人称|にんしょう|ニンショウ)\\s*パートナー/g, replacement: "臨床ポケットパートナー" },
                 { pattern: /臨床\\s*ポケット\\s*パートナー/g, replacement: "臨床ポケットパートナー" },
-                { pattern: /臨床\\s*ポケット/g, replacement: "臨床ポケット" }
+                { pattern: /臨床\\s*ポケット/g, replacement: "臨床ポケット" },
+                { pattern: /バイマ|ばいま/g, replacement: "BUYMA" },
+                { pattern: /エッセンス/g, replacement: "SSENSE" },
+                { pattern: /ユークス/g, replacement: "YOOX" }
             ];
 
             function normalizeSpeechText(text) {
@@ -425,7 +582,7 @@ async def get_dashboard(username: str = Depends(get_current_username)):
             // 非同期トーストUI（安全運転妨害防止）
             function showToastNotification(message, durationMs = 4000) {
                 const toast = document.createElement('div');
-                toast.className = 'fixed top-4 left-1/2 transform -translate-x-1/2 bg-amber-600/90 text-white px-4 py-2 rounded-lg text-sm shadow-lg z-50 transition-opacity duration-300 font-sans';
+                toast.className = 'fixed top-4 left-1/2 transform -translate-x-1/2 bg-sky-800/90 text-white px-4 py-2 rounded-lg text-sm shadow-lg z-50 transition-opacity duration-300 font-sans border border-sky-600';
                 toast.textContent = message;
                 document.body.appendChild(toast);
                 setTimeout(() => {
@@ -472,18 +629,20 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                 try {
                     isStarting = true;
                     recognition.start();
-                    micBtn.classList.remove('jarvis-btn-thinking');
+                    micBtn.classList.remove('jarvis-btn-thinking', 'jarvis-btn-speaking');
                     micBtn.classList.add('jarvis-btn-active');
                     micBtn.innerText = '🎙️ お話しください...（全音声に反応）';
                     statusText.innerText = '周囲の音声を監視中...';
+                    systemStatus.innerText = 'STATUS: LISTENING';
                 } catch (e) {
                     isStarting = false;
                     if (e.name === 'InvalidStateError') {
                         isRecognizing = true;
-                        micBtn.classList.remove('jarvis-btn-thinking');
+                        micBtn.classList.remove('jarvis-btn-thinking', 'jarvis-btn-speaking');
                         micBtn.classList.add('jarvis-btn-active');
                         micBtn.innerText = '🎙️ お話しください...（全音声に反応）';
                         statusText.innerText = '周囲の音声を監視中...';
+                        systemStatus.innerText = 'STATUS: LISTENING';
                     } else if (e.name !== 'NotAllowedError') {
                         setTimeout(() => {
                             if (isContinuousMode && !isAiSpeaking && !isAiThinking && !isRecognizing && !isStarting) {
@@ -505,10 +664,11 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                     isStarting = false;
                     isRecognizing = true;
                     if (isAiSpeaking || isAiThinking) return;
-                    micBtn.classList.remove('jarvis-btn', 'jarvis-btn-thinking');
+                    micBtn.classList.remove('jarvis-btn', 'jarvis-btn-thinking', 'jarvis-btn-speaking');
                     micBtn.classList.add('jarvis-btn-active');
                     micBtn.innerText = '🎙️ お話しください...（全音声に反応）';
                     statusText.innerText = '周囲の音声を監視中...';
+                    systemStatus.innerText = 'STATUS: LISTENING';
                 };
                 
                 recognition.onresult = (event) => {
@@ -523,7 +683,7 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                     if (!newTranscript || newTranscript.length < 2) return;
 
                     // システム定型アナウンスのエコー誤検知フィルター
-                    const systemPhrases = ["リクエストを受け付け", "バックグラウンド調査", "キューに登録", "報告書が完成しました", "内容を読み上げます", "以下省略します"];
+                    const systemPhrases = ["リクエストを受け付け", "バックグラウンド調査", "キューに登録", "報告書が完成しました", "内容を読み上げます", "以下省略します", "裏で調査", "進めておきます"];
                     if (systemPhrases.some(p => newTranscript.includes(p))) {
                         console.log("System message echo ignored:", newTranscript);
                         return;
@@ -560,7 +720,7 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                         statusText.innerText = '送信します';
                         transcriptBuffer = "";
                         form.dispatchEvent(new Event('submit'));
-                    }, 2500); // ユーザーの話し終わりを待機
+                    }, 2200); // ユーザーの話し終わりを待機
                 };
 
                 recognition.onerror = (event) => {
@@ -571,9 +731,10 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                             statusText.innerText = '⚠️ マイク使用が拒否されました。Safari設定（ぁあ > Webサイトの設定 > マイク）で許可してください';
                             isContinuousMode = false;
                             isRecognizing = false;
-                            micBtn.classList.remove('jarvis-btn-active', 'jarvis-btn-thinking');
+                            micBtn.classList.remove('jarvis-btn-active', 'jarvis-btn-thinking', 'jarvis-btn-speaking');
                             micBtn.classList.add('jarvis-btn');
                             micBtn.innerText = '🎙️ マイク許可後にタップしてください';
+                            systemStatus.innerText = 'STATUS: STANDBY';
                             break;
                         case 'network':
                             statusText.innerText = '⚠️ 音声認識ネットワーク待機中...自動復帰を試みます';
@@ -588,7 +749,6 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                             statusText.innerText = '⚠️ マイク機器が検出されません。マイクが利用可能かご確認ください';
                             break;
                         case 'aborted':
-                            // 送信や発話時の意図的アボート
                             break;
                         default:
                             statusText.innerText = '音声認識ステータス: ' + event.error;
@@ -641,10 +801,11 @@ async def get_dashboard(username: str = Depends(get_current_username)):
             micBtn.addEventListener('click', () => {
                 isContinuousMode = !isContinuousMode;
                 if(isContinuousMode) {
-                    micBtn.classList.remove('jarvis-btn', 'jarvis-btn-thinking');
+                    micBtn.classList.remove('jarvis-btn', 'jarvis-btn-thinking', 'jarvis-btn-speaking');
                     micBtn.classList.add('jarvis-btn-active');
                     micBtn.innerText = '🎙️ お話しください...（全音声に反応）';
                     statusText.innerText = '周囲の音声を監視中...';
+                    systemStatus.innerText = 'STATUS: LISTENING';
                     try { unlockAudio(); } catch(e) { console.warn(e); }
                     restartRecognitionIfNeeded();
                 } else {
@@ -653,14 +814,15 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                     }
                     isRecognizing = false;
                     isStarting = false;
-                    micBtn.classList.remove('jarvis-btn-active', 'jarvis-btn-thinking');
+                    micBtn.classList.remove('jarvis-btn-active', 'jarvis-btn-thinking', 'jarvis-btn-speaking');
                     micBtn.classList.add('jarvis-btn');
                     micBtn.innerText = '🎙️ 常時リスニング開始';
                     statusText.innerText = 'マイクはオフです';
+                    systemStatus.innerText = 'STATUS: STANDBY';
                 }
             });
 
-            // 長文音声朗読キューエンジン（iOS Safariハングアップ・無音防止対応）
+            // 長文・短文音声朗読キューエンジン（iOS Safariハングアップ・無音防止対応）
             let ttsQueue = [];
             let safariResumeInterval = null;
 
@@ -678,7 +840,6 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                     return;
                 }
 
-                // 進行中の認識バッファやタイマーをクリアしてエコー誤送信を防止
                 try {
                     if (typeof speechTimeout !== 'undefined' && speechTimeout) {
                         clearTimeout(speechTimeout);
@@ -696,19 +857,19 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                 lastSpokenText = fullText;
                 lastSpokenTime = Date.now();
 
-                micBtn.classList.remove('jarvis-btn-active');
-                micBtn.classList.add('jarvis-btn-thinking');
-                micBtn.innerText = '🔊 JARVIS 発話中...';
-                statusText.innerText = '報告書を音声解説中（マイク一時停止）';
+                micBtn.classList.remove('jarvis-btn-active', 'jarvis-btn-thinking');
+                micBtn.classList.add('jarvis-btn-speaking');
+                micBtn.innerText = '🔊 社長分身AI 発話中...';
+                systemStatus.innerText = 'STATUS: SPEAKING';
+                statusText.innerText = isShortReply ? '壁打ち音声を再生中（マイク一時停止）' : '報告書を音声解説中（マイク一時停止）';
 
-                // 再生キューの作成
                 ttsQueue = splitIntoSentences(fullText);
                 if (ttsQueue.length === 0) {
-                    onAiFinishedSpeaking();
+                    if (!isShortReply) onAiFinishedSpeaking();
+                    else resumeListeningAfterShortReply();
                     return;
                 }
 
-                // Safariの再生15秒停止バグを防止する定期resume
                 if (safariResumeInterval) clearInterval(safariResumeInterval);
                 safariResumeInterval = setInterval(() => {
                     if (window.speechSynthesis && window.speechSynthesis.speaking) {
@@ -717,8 +878,6 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                 }, 4000);
 
                 try { window.speechSynthesis.cancel(); } catch(_) {}
-
-                // 再生開始
                 playNextSentence(isShortReply);
             }
 
@@ -726,7 +885,6 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                 if (!isAiSpeaking) return;
 
                 if (ttsQueue.length === 0) {
-                    // 全文再生完了
                     if (safariResumeInterval) {
                         clearInterval(safariResumeInterval);
                         safariResumeInterval = null;
@@ -744,11 +902,10 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                 const sentence = ttsQueue.shift();
                 const utterance = new SpeechSynthesisUtterance(sentence);
                 utterance.lang = 'ja-JP';
-                utterance.rate = 1.05;
-                utterance.pitch = 0.95;
+                utterance.rate = 1.08;
+                utterance.pitch = 0.98;
                 window.currentUtterance = utterance;
 
-                // 自然な日本語音声の選定
                 const voices = window.speechSynthesis.getVoices();
                 const jpVoices = voices.filter(v => v.lang.includes('ja'));
                 if (jpVoices.length > 0) {
@@ -756,7 +913,8 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                         v.name.includes('Google') || 
                         v.name.includes('Premium') || 
                         v.name.includes('Nanami') || 
-                        v.name.includes('Kyoko')
+                        v.name.includes('Kyoko') ||
+                        v.name.includes('Otoya')
                     );
                     utterance.voice = bestVoice || jpVoices[0];
                 }
@@ -765,7 +923,7 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                 const nextStep = () => {
                     if (isSentenceDone) return;
                     isSentenceDone = true;
-                    setTimeout(() => playNextSentence(isShortReply), 80);
+                    setTimeout(() => playNextSentence(isShortReply), 70);
                 };
 
                 utterance.onend = nextStep;
@@ -774,7 +932,6 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                     nextStep();
                 };
 
-                // 文ごとのタイムアウトガード（iOSの無音ハングアップ防止）
                 const maxSentenceDuration = Math.max(3000, sentence.length * 350 + 2000);
                 setTimeout(() => {
                     if (!isSentenceDone && isAiSpeaking) {
@@ -800,7 +957,6 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                 }
                 if (micCooldownTimer) clearTimeout(micCooldownTimer);
 
-                // エコー防止: スピーカー残響回避のためのクールダウン（1000ms）
                 micCooldownTimer = setTimeout(() => {
                     isAiSpeaking = false;
                     transcriptBuffer = "";
@@ -808,10 +964,11 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                     if (isContinuousMode && !isAiThinking) {
                         restartRecognitionIfNeeded();
                     } else if (!isContinuousMode) {
-                        micBtn.classList.remove('jarvis-btn-thinking', 'jarvis-btn-active');
+                        micBtn.classList.remove('jarvis-btn-thinking', 'jarvis-btn-speaking', 'jarvis-btn-active');
                         micBtn.classList.add('jarvis-btn');
                         micBtn.innerText = '🎙️ 常時リスニング開始';
                         statusText.innerText = 'マイクはオフです';
+                        systemStatus.innerText = 'STATUS: STANDBY';
                     }
                 }, 1000);
             }
@@ -821,17 +978,17 @@ async def get_dashboard(username: str = Depends(get_current_username)):
             }
 
             // R4-04: モバイル回線瞬断時における自動リトライ（指数バックオフ）
-            async function sendRequestWithExponentialBackoff(message, maxAttempts = 3) {
+            async function sendConverseWithExponentialBackoff(message, mode = "auto", maxAttempts = 3) {
                 let delay = 1000;
                 for (let attempt = 1; attempt <= maxAttempts; attempt++) {
                     try {
-                        const res = await fetch('/api/chat', {
+                        const res = await fetch('/api/converse', {
                             method: 'POST',
                             headers: { 
                                 'Content-Type': 'application/json',
                                 'Bypass-Tunnel-Reminder': 'true'
                             },
-                            body: JSON.stringify({ message })
+                            body: JSON.stringify({ message, mode })
                         });
                         if (res.ok) return res;
                         throw new Error(`HTTP ${res.status}`);
@@ -850,7 +1007,6 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                 if (!rawMessage) return;
                 const message = normalizeSpeechText(rawMessage);
 
-                // 認識タイマーのクリアとマイクの一時停止
                 try {
                     if (typeof speechTimeout !== 'undefined' && speechTimeout) {
                         clearTimeout(speechTimeout);
@@ -862,19 +1018,20 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                     }
                 } catch(err) {}
                 isRecognizing = false;
-                hasPendingRequest = true;
+                hasPendingRequest = (activeMode === 'task');
 
                 if (window.pendingRequestTimer) clearTimeout(window.pendingRequestTimer);
-                window.pendingRequestTimer = setTimeout(() => {
-                    if (hasPendingRequest) {
-                        hasPendingRequest = false;
-                        isAiThinking = false;
-                        statusText.innerText = '待機時間を超過しました。再度お話しいただくか送信してください。';
-                        if (isContinuousMode) restartRecognitionIfNeeded();
-                    }
-                }, 90000);
+                if (activeMode === 'task') {
+                    window.pendingRequestTimer = setTimeout(() => {
+                        if (hasPendingRequest) {
+                            hasPendingRequest = false;
+                            isAiThinking = false;
+                            statusText.innerText = 'タスク待機時間を超過しました。再度お話しいただくか送信してください。';
+                            if (isContinuousMode) restartRecognitionIfNeeded();
+                        }
+                    }, 90000);
+                }
 
-                // iOS Safari オーディオパイプラインの事前活性化（回答受信時の無音防止）
                 try {
                     unlockAudio();
                     if (window.speechSynthesis) {
@@ -886,26 +1043,25 @@ async def get_dashboard(username: str = Depends(get_current_username)):
 
                 isAiThinking = true;
 
-                appendMessage('You', message, 'bg-sky-900 border border-sky-700 self-end');
+                appendMessage('社長', message, 'bg-sky-950 border border-sky-700 self-end');
                 input.value = '';
                 input.disabled = true;
                 sendButton.disabled = true;
                 
                 if (isContinuousMode) {
-                    micBtn.classList.remove('jarvis-btn-active');
+                    micBtn.classList.remove('jarvis-btn-active', 'jarvis-btn-speaking');
                     micBtn.classList.add('jarvis-btn-thinking');
                     micBtn.innerText = '⏳ 思考中...';
                 }
 
-                systemStatus.innerText = 'STATUS: PROCESSING';
-                statusText.innerText = 'リクエストを送信中...';
+                systemStatus.innerText = 'STATUS: THINKING';
+                statusText.innerText = activeMode === 'talk' ? '壁打ち思考中（1〜2秒で即答）...' : 'タスク指示を送信中...';
 
-                const agentBubble = appendMessage('J.A.R.V.I.S.', '...', 'jarvis-panel self-start w-5/6');
+                const agentBubble = appendMessage('社長分身AI', '...', 'jarvis-panel self-start w-5/6');
                 const contentDiv = agentBubble.querySelector('.content');
 
                 try {
-                    const response = await sendRequestWithExponentialBackoff(message);
-                    
+                    const response = await sendConverseWithExponentialBackoff(message, activeMode);
                     const reader = response.body.getReader();
                     const decoder = new TextDecoder();
                     contentDiv.innerText = ''; 
@@ -922,26 +1078,31 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                     
                     isAiThinking = false;
                     systemStatus.innerText = 'STATUS: ONLINE';
-                    statusText.innerText = 'リクエストを受け付けました。調査完了まで待機中...';
                     
-                    // 【受付確認の音声読み上げは廃止】
-                    // ユーザーの要望により、リクエスト受付時のspeakTextは呼び出さず画面表示のみ（無音化）とする。
-                    // 音声読み上げは調査完了後の報告書（spoken_summary）のみで行う。
+                    if (activeMode === 'talk') {
+                        statusText.innerText = '回答を音声出力中...';
+                        if (fullResponse.trim()) {
+                            speakText(fullResponse.trim(), true);
+                        }
+                    } else {
+                        statusText.innerText = 'リクエストを受け付けました。調査完了まで待機中...';
+                        if (fullResponse.trim()) {
+                            speakText(fullResponse.trim(), true);
+                        }
+                    }
 
                 } catch (error) {
                     isAiThinking = false;
-                    contentDiv.innerText += '\\n[通信エラー]';
+                    contentDiv.innerText += '\\n[通信エラーが発生しました]';
                     systemStatus.innerText = 'STATUS: ERROR';
                     statusText.innerText = '通信エラーが発生しました';
+                    if (isContinuousMode) {
+                        restartRecognitionIfNeeded();
+                    }
                 } finally {
                     input.disabled = false;
                     sendButton.disabled = false;
-                    
-                    if (isContinuousMode) {
-                        micBtn.classList.remove('jarvis-btn-thinking');
-                        micBtn.classList.add('jarvis-btn-active');
-                        micBtn.innerText = '🎙️ お話しください...（全音声に反応）';
-                        // リクエスト受付完了後に音声認識を再開
+                    if (!isAiSpeaking && isContinuousMode) {
                         restartRecognitionIfNeeded();
                     }
                     if (!isContinuousMode) {
@@ -985,12 +1146,12 @@ async def get_dashboard(username: str = Depends(get_current_username)):
                             lastReportFilename = data.filename;
                             lastReportContent = data.content;
                             document.getElementById('current-report-name').innerText = data.filename;
+                            
                             // R1-02: レポート描画（DOMPurifyによるXSSサニタイズ）
                             const rawHtml = marked.parse(data.content);
                             const sanitizedHtml = DOMPurify.sanitize(rawHtml);
                             document.getElementById('markdown-viewer').innerHTML = sanitizedHtml;
 
-                            // 新着レポート、またはユーザーが指示を出して待機していた場合は必ず全文朗読
                             if (!isInitialReportLoad || isNewReport || hasPendingRequest) {
                                 if (window.pendingRequestTimer) {
                                     clearTimeout(window.pendingRequestTimer);
